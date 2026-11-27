@@ -49,7 +49,7 @@ jobs:
 
       - name: Kompilasi library native Rust (cdylib)
         working-directory: android
-        run: ANDROID_NDK_HOME="${ANDROID_NDK_ROOT}" ./cargo-build.sh
+        run: ./cargo-build.sh
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3

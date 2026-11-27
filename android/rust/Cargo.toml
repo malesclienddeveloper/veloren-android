@@ -10,8 +10,6 @@ crate-type = ["cdylib"]
 # Stub: saat ini hanya mengekspor ANativeActivity_onCreate.
 # Untuk mengintegrasikan voxygen sebenarnya, tambahkan dependensi winit/ndk di sini
 # dan panggil logika run() voxygen dari jembatan Android.
-[target.'cfg(target_os = "android")'.dependencies]
-ndk = "0.8"
 
 [profile.release]
 opt-level = 3

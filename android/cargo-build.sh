@@ -19,8 +19,8 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUST_DIR="$ROOT_DIR/android/rust"
 APK_JNI_DIR="$ROOT_DIR/android/app/src/main/jniLibs/arm64-v8a"
 
-# GitHub Action android-actions/setup-android sets ANDROID_NDK_ROOT;
-# local/manual use typically sets ANDROID_NDK_HOME. Accept either.
+# --- Lokasi NDK -------------------------------------------------------------
+# Pilih ANDROID_NDK_HOME bila tersedia, jika tidak gunakan ANDROID_NDK_ROOT.
 if [ -z "${ANDROID_NDK_HOME:-}" ]; then
     export ANDROID_NDK_HOME="${ANDROID_NDK_ROOT:-}"
 fi
@@ -29,13 +29,19 @@ if [ -z "${ANDROID_NDK_HOME:-}" ]; then
     exit 1
 fi
 
-# Pastikan linker clang dari NDK ada di PATH agar .cargo/config.toml dapat
-# menemukannya (biasanya difilter melalui CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER).
-NDK_CLANG_DIR="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt"
-if [ -d "$NDK_CLANG_DIR" ]; then
-    HOST_DIR="$(ls -1 "$NDK_CLANG_DIR" | head -n1)"
-    export PATH="$NDK_CLANG_DIR/$HOST_DIR/bin:$PATH"
+# --- Temukan linker clang Android (aarch64-linux-android-clang) -------------
+# Cari biner secara rekursif; kalau ketemu, set CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
+# (override `linker` di .cargo/config.toml) dan tambahkan dirnya ke PATH.
+CLANG="$(find "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt" -type f -name 'aarch64-linux-android-clang' 2>/dev/null | head -n1)"
+if [ -z "$CLANG" ]; then
+    CLANG="$(find "${ANDROID_NDK_HOME}" -type f -name 'aarch64-linux-android-clang' 2>/dev/null | head -n1)"
 fi
+if [ -n "$CLANG" ]; then
+    export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG"
+    export PATH="$(dirname "$CLANG"):$PATH"
+fi
+echo "[cargo-build] ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+echo "[cargo-build] linker=${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-<not found, relying on PATH name>}"
 
 echo "[cargo-build] membersihkan jniLibas lama..."
 rm -rf "$APK_JNI_DIR"
