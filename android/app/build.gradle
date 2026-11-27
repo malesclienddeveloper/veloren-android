@@ -42,6 +42,3 @@ android {
     // terpisah oleh cargo-build.sh dan .so disalurkan via jniLibs.
 }
 
-dependencies {
-    implementation 'androidx.activity:activity:1.8.0'
-}
