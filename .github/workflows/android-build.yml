@@ -26,9 +26,12 @@ jobs:
       - name: Setup Android SDK + NDK
         uses: android-actions/setup-android@v3
         with:
-          ndk: r27b
-          api-level: 34
-          build-tools: 34.0.0
+          packages: |
+            platform-tools
+            platforms;android-34
+            build-tools;34.0.0
+            ndk;27.2.12479018
+          accept-android-sdk-licenses: true
 
       - name: Setup Rust + target Android
         uses: dtolnay/rust-toolchain@master
@@ -45,11 +48,8 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Kompilasi library native Rust (cdylib)
-        run: |
-          cd android
-          ANDROID_NDK_HOME="${ANDROID_NDK_ROOT}" ./cargo-build.sh
-        env:
-          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
+        working-directory: android
+        run: ANDROID_NDK_HOME="${ANDROID_NDK_ROOT}" ./cargo-build.sh
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
