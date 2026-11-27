@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'net.veloren.veloren'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'net.veloren.veloren'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '1.0.0'
+
+        // Arsitektur yang di-build. Tambahkan armeabi-v7a / x86_64 bila perlu.
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+
+        // .so dikompilasi oleh cargo-build.sh dan ditempelkan ke
+        // src/main/jniLibs/<abi>/ ; Gradle secara otomatis memasukkannya ke APK.
+        sourceSets {
+            main {
+                jniLibs.srcDirs = ['src/main/jniLibs']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            // Android Gradle Plugin otomatis membuat debug keystore bawaan;
+            // tidak perlu menentukan signingConfig secara manual.
+        }
+    }
+
+    // Tidak menggunakan externalNativeBuild (CMake); kompilasi Rust dilakukan
+    // terpisah oleh cargo-build.sh dan .so disalurkan via jniLibs.
+}
+
+dependencies {
+    implementation 'androidx.activity:activity:1.8.0'
+}

@@ -1,0 +1,2 @@
+rootProject.name = "veloren-android"
+include ':app'

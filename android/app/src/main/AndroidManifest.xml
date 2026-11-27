@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="net.veloren.veloren">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Sentuh bukan wajib (dukungan pengendali/keyboard juga mungkin), ditandai opsional. -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="false"
+        android:preserveExternalStorageOnInstall="true"
+        android:label="Veloren"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+        android:resizeableActivity="true">
+
+        <activity
+            android:name=".VelorenActivity"
+            android:label="Veloren"
+            android:screenOrientation="unspecified"
+            android:configChanges="orientation|keyboardHidden|screenSize|smallestScreenSize|uiMode|layoutDirection"
+            android:exported="true">
+
+            <!-- Nama library native yang dimuat NativeActivity (harus cocok dengan nama cdylib Rust). -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="veloren_android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
