@@ -90,7 +90,7 @@ pub struct Launcher {
 }
 
 impl Launcher {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             state: LauncherState::OpenNormal,
             progress: DownloadProgress::default(),
