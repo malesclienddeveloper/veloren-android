@@ -20,14 +20,16 @@ unsafe fn render_solid(window: *mut ndk_sys::ANativeWindow) {
     let Some(nonnull) = NonNull::new(window) else { return };
     // clone_from_ptr menaikkan ref-count; Drop akan menguranginya.
     let native = ndk::native_window::NativeWindow::clone_from_ptr(nonnull);
-    if let Ok(mut guard) = native.lock(None) {
-        if let Some(bytes) = guard.bytes() {
-            for b in bytes.iter_mut() {
-                b.write(FILL_BYTE);
-            }
+    let mut guard = match native.lock(None) {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if let Some(bytes) = guard.bytes() {
+        for b in bytes.iter_mut() {
+            b.write(FILL_BYTE);
         }
-        // drop(guard) -> ANativeWindow_unlockAndPost()
     }
+    // drop(guard) -> ANativeWindow_unlockAndPost(); native drop terakhir
 }
 
 unsafe extern "C" fn on_native_window_created(
