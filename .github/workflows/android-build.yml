@@ -55,8 +55,14 @@ jobs:
         uses: gradle/actions/setup-gradle@v3
 
       - name: Build APK (debug)
-        run: ./gradlew assembleDebug
         working-directory: android
+        run: |
+          # Repo belum selalu membawa `gradlew`; buat wrapper lalu pakai itu,
+          # atau pakai `gradle` dari gradle/actions/setup-gradle.
+          if [ ! -x ./gradlew ]; then
+            gradle wrapper
+          fi
+          ./gradlew assembleDebug
 
       - name: Upload APK sebagai artifact
         uses: actions/upload-artifact@v4
