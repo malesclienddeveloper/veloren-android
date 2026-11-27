@@ -1,0 +1,4 @@
+# Aset game di-kemas saat build/CI (salin assets/ di sini), jangan commit binary LFS di repo ini.
+*
+!.gitignore
+!.gitkeep
