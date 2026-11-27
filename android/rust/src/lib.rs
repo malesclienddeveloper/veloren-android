@@ -1,41 +1,73 @@
-//! Jembatan native minimal untuk launcher Android Veloren.
+//! Minimal native Android renderer untuk launcher Veloren.
 //!
-//! FILE INI ADALAH STUB. Diekspor sebagai `libveloren_android.so` dan dipanggil
-//! oleh `NativeActivity` melalui `ANativeActivity_onCreate`.
+//! `ANativeActivity_onCreate` mendaftarkan callback `onNativeWindowCreated` /
+//! `onNativeWindowResized` / `onNativeWindowRedrawNeeded`, lalu menggambar
+//! **solid-color** ke `ANativeWindow`. Ini membuktikan pipeline native Rust ->
+//! NativeActivity -> rendering hidup. Belum Veloren.
 //!
-//! Integrasi sebenarnya dengan voxygen (loop event winit pada Android, grafis
-//! wgpu, audio kira/cpal, tokio, direktori userdata Android, input sentuh) BELUM
-//! diimplementasikan. Ganti isi `ANativeActivity_onCreate` di bawah dengan
-//! inisialisasi game yang benar.
+//! Integrasi sebenarnya (winit + wgpu + voxygen + aset + input sentuh) menjadi
+//! langkah berikutnya; lihat README.
 
 #![allow(non_snake_case)]
-#![allow(dead_code)]
 
-use std::ffi::CString;
-use std::ptr;
+use std::ptr::NonNull;
 
-/// Representasi minimum dari ANativeActivity (cukup untuk tanda tangan fungsi;
-/// definisi lengkap ada di header NDK `native_activity.h`).
-#[repr(C)]
-pub struct ANativeActivity {
-    _unused: [u8; 0],
+/// Jenis piksel solid untuk uji pipeline. 0xFF = penuh (lihat format buffer).
+const FILL_BYTE: u8 = 0xFF;
+
+/// Gambar warna solid penuh ke `ANativeWindow`.
+unsafe fn render_solid(window: *mut ndk::ffi::ANativeWindow) {
+    let Some(nonnull) = NonNull::new(window) else { return };
+    // clone_from_ptr menaikkan ref-count; Drop akan menguranginya.
+    let native = ndk::native_window::NativeWindow::clone_from_ptr(nonnull);
+    if let Ok(mut guard) = native.lock(None) {
+        if let Some(bytes) = guard.bytes() {
+            for b in bytes.iter_mut() {
+                b.write(FILL_BYTE);
+            }
+        }
+        // drop(guard) -> ANativeWindow_unlockAndPost()
+    }
 }
 
-/// Tanda tangan `ANativeActivity_onCreate` yang diharapkan NativeActivity.
-///
-/// `savedInstanceState` boleh nol jika aktivitas baru dibuat.
+unsafe extern "C" fn on_native_window_created(
+    _activity: *mut ndk::ffi::ANativeActivity,
+    window: *mut ndk::ffi::ANativeWindow,
+) {
+    render_solid(window);
+}
+
+unsafe extern "C" fn on_native_window_resized(
+    _activity: *mut ndk::ffi::ANativeActivity,
+    window: *mut ndk::ffi::ANativeWindow,
+) {
+    render_solid(window);
+}
+
+unsafe extern "C" fn on_native_window_redraw_needed(
+    _activity: *mut ndk::ffi::ANativeActivity,
+    window: *mut ndk::ffi::ANativeWindow,
+) {
+    render_solid(window);
+}
+
+/// Tanda tangan `ANativeActivity_onCreate` yang diharapkan `NativeActivity`.
 #[no_mangle]
 pub extern "C" fn ANativeActivity_onCreate(
-    _activity: *mut ANativeActivity,
+    activity: *mut ndk::ffi::ANativeActivity,
     _savedInstanceState: *mut std::ffi::c_void,
     _savedInstanceStateSize: usize,
 ) {
-    let _tag = CString::new("VelorenAndroid").expect("CString gagal dibuat");
-
-    // TODO: ganti stub ini dengan inisialisasi voxygen sebenarnya:
-    //   1. Ambil ANativeWindow / AInputQueue dari activity (via ANativeActivity callbacks).
-    //   2. Buat winit EventLoop untuk Android dan Window.
-    //   3. Panggil logika run() voxygen dengan settings yang cocok Android.
-    //   4. Atur direktori userdata ke konteks internal Android.
-    let _ = ptr::null::<()>();
+    if activity.is_null() {
+        return;
+    }
+    unsafe {
+        if let Some(activity_ref) = activity.as_mut() {
+            if let Some(callbacks) = activity_ref.callbacks.as_mut() {
+                callbacks.onNativeWindowCreated = Some(on_native_window_created);
+                callbacks.onNativeWindowResized = Some(on_native_window_resized);
+                callbacks.onNativeWindowRedrawNeeded = Some(on_native_window_redraw_needed);
+            }
+        }
+    }
 }
