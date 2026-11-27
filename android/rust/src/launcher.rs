@@ -93,8 +93,14 @@ impl Launcher {
     pub const fn new() -> Self {
         Self {
             state: LauncherState::OpenNormal,
-            progress: DownloadProgress::default(),
-            verification: AssetVerification::default(),
+            // tidak pakai Default::default() (non-const) di const fn
+            progress: DownloadProgress { downloaded: 0, total: 0 },
+            verification: AssetVerification {
+                source_count: 0,
+                dest_count: 0,
+                no_lfs_pointer: false,
+                checksum_ok: false,
+            },
         }
     }
 
