@@ -24,14 +24,14 @@ jobs:
           java-version: 21
 
       - name: Setup Android SDK + NDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            platform-tools
-            platforms;android-34
-            build-tools;34.0.0
-            ndk;27.2.12479018
-          accept-android-sdk-licenses: true
+        # ubuntu-latest sudah memasang Android SDK + NDK; pastikan platform & build-tools.
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Setup Rust + target Android
         uses: dtolnay/rust-toolchain@master
