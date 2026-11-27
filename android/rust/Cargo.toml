@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ndk = "0.8"
+ndk-sys = "0.5"
 
 [profile.release]
 opt-level = 3

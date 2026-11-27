@@ -16,7 +16,7 @@ use std::ptr::NonNull;
 const FILL_BYTE: u8 = 0xFF;
 
 /// Gambar warna solid penuh ke `ANativeWindow`.
-unsafe fn render_solid(window: *mut ndk::ffi::ANativeWindow) {
+unsafe fn render_solid(window: *mut ndk_sys::ANativeWindow) {
     let Some(nonnull) = NonNull::new(window) else { return };
     // clone_from_ptr menaikkan ref-count; Drop akan menguranginya.
     let native = ndk::native_window::NativeWindow::clone_from_ptr(nonnull);
@@ -31,22 +31,22 @@ unsafe fn render_solid(window: *mut ndk::ffi::ANativeWindow) {
 }
 
 unsafe extern "C" fn on_native_window_created(
-    _activity: *mut ndk::ffi::ANativeActivity,
-    window: *mut ndk::ffi::ANativeWindow,
+    _activity: *mut ndk_sys::ANativeActivity,
+    window: *mut ndk_sys::ANativeWindow,
 ) {
     render_solid(window);
 }
 
 unsafe extern "C" fn on_native_window_resized(
-    _activity: *mut ndk::ffi::ANativeActivity,
-    window: *mut ndk::ffi::ANativeWindow,
+    _activity: *mut ndk_sys::ANativeActivity,
+    window: *mut ndk_sys::ANativeWindow,
 ) {
     render_solid(window);
 }
 
 unsafe extern "C" fn on_native_window_redraw_needed(
-    _activity: *mut ndk::ffi::ANativeActivity,
-    window: *mut ndk::ffi::ANativeWindow,
+    _activity: *mut ndk_sys::ANativeActivity,
+    window: *mut ndk_sys::ANativeWindow,
 ) {
     render_solid(window);
 }
@@ -54,7 +54,7 @@ unsafe extern "C" fn on_native_window_redraw_needed(
 /// Tanda tangan `ANativeActivity_onCreate` yang diharapkan `NativeActivity`.
 #[no_mangle]
 pub extern "C" fn ANativeActivity_onCreate(
-    activity: *mut ndk::ffi::ANativeActivity,
+    activity: *mut ndk_sys::ANativeActivity,
     _savedInstanceState: *mut std::ffi::c_void,
     _savedInstanceStateSize: usize,
 ) {
