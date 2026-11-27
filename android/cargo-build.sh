@@ -32,10 +32,20 @@ fi
 # --- Temukan linker clang Android (aarch64-linux-android-clang) -------------
 # Cari biner secara rekursif; kalau ketemu, set CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER
 # (override `linker` di .cargo/config.toml) dan tambahkan dirnya ke PATH.
-CLANG="$(find "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt" -type f -name 'aarch64-linux-android-clang' 2>/dev/null | head -n1)"
+# Jangan pakai -type f: biner NDK sering symlink; nama bisa polos atau pakai level API.
+PREBUILT="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt"
+CLANG="$(find "$PREBUILT" -name 'aarch64-linux-android-clang' 2>/dev/null | head -n1)"
 if [ -z "$CLANG" ]; then
-    CLANG="$(find "${ANDROID_NDK_HOME}" -type f -name 'aarch64-linux-android-clang' 2>/dev/null | head -n1)"
+    CLANG="$(find "$PREBUILT" -name 'aarch64-linux-android*-clang' 2>/dev/null | sort | head -n1)"
 fi
+if [ -z "$CLANG" ]; then
+    CLANG="$(find "${ANDROID_NDK_HOME}" -name 'aarch64-linux-android*-clang' 2>/dev/null | sort | head -n1)"
+fi
+if [ -z "$CLANG" ]; then
+    BIN_DIR="$(find "$PREBUILT" -type d -name bin 2>/dev/null | head -n1)"
+    if [ -n "$BIN_DIR" ] && [ -x "$BIN_DIR/clang" ]; then CLANG="$BIN_DIR/clang"; fi
+fi
+echo "[cargo-build] NDK clang bin dir contents:"; ls "$PREBUILT"/*/bin 2>/dev/null | head -n8 || true
 if [ -n "$CLANG" ]; then
     export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG"
     export PATH="$(dirname "$CLANG"):$PATH"
