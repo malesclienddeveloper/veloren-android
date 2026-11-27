@@ -10,6 +10,8 @@
 
 #![allow(non_snake_case)]
 
+pub mod launcher;
+
 use std::ptr::NonNull;
 
 /// Jenis piksel solid untuk uji pipeline. 0xFF = penuh (lihat format buffer).
