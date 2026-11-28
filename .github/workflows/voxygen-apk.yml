@@ -55,6 +55,12 @@ jobs:
         run: |
           git remote add upstream https://gitlab.com/veloren/veloren.git
           git fetch upstream master
+          echo "shallow: $(git rev-parse --is-shallow-repository)"
+          echo "--- upstream"; git log -5 --date=iso --pretty='%h %cd %s' upstream/master
+          echo "--- fork";     git log -5 --date=iso --pretty='%h %cd %s' HEAD
+          echo "merge-base: $(git merge-base HEAD upstream/master || echo TIDAK ADA)"
+          echo "root upstream: $(git rev-list --max-parents=0 upstream/master | head -3 | tr '\n' ' ')"
+          echo "root fork: $(git rev-list --max-parents=0 HEAD | head -3 | tr '\n' ' ')"
           # Gagal di sini berarti ada konflik antara update resmi dan port Android.
           git merge --no-edit upstream/master
           git lfs fetch upstream "$(git rev-parse upstream/master)"
