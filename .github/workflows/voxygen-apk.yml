@@ -1,5 +1,6 @@
-# Build APK debug Voxygen asli: kode game dari fork ejir/veloren (commit dipatok)
-# ditambah patch di android-patches/.
+# Build APK debug Voxygen asli: port Android dari fork ejir/veloren (commit dipatok)
+# + patch di android-patches/ + master TERBARU dari Veloren resmi.
+# "Re-run all jobs" pada run terakhir sudah cukup untuk mengambil update baru.
 name: Build Voxygen APK
 
 on:
@@ -17,6 +18,7 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
+      ANDROID_USER_HOME: ${{ github.workspace }}/.android-home
     steps:
       # Dua checkout di folder terpisah, supaya .cargo/config.toml repo ini
       # tidak ikut memengaruhi build di src/.
@@ -33,11 +35,56 @@ jobs:
           ref: f7f1684ddf9b44928af810964f11321692c8cf7b
           path: src
           lfs: true
+          fetch-depth: 0
+          filter: blob:none
           persist-credentials: false
 
-      - name: Terapkan patch
+      - name: Terapkan patch Android
         working-directory: src
-        run: git apply --verbose ../kit/android-patches/*.patch
+        run: |
+          git config user.name "android-build"
+          git config user.email "android-build@users.noreply.github.com"
+          git apply --index --verbose ../kit/android-patches/*.patch
+          git commit -qm "android patches"
+
+      - name: Gabungkan Veloren resmi terbaru
+        working-directory: src
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: |
+          git remote add upstream https://gitlab.com/veloren/veloren.git
+          git fetch --filter=blob:none upstream master
+          # Gagal di sini berarti ada konflik antara update resmi dan port Android.
+          git merge --no-edit upstream/master
+          git lfs fetch upstream "$(git rev-parse upstream/master)"
+          git lfs checkout
+          # Pastikan tidak ada aset yang masih berupa pointer LFS.
+          missing="$(git lfs ls-files | awk '$2 == "-"')"
+          if [ -n "$missing" ]; then
+            echo "::error::Aset LFS belum terunduh:"; echo "$missing" | head -20; exit 1
+          fi
+          # Laporkan versi resmi ke server, bukan hash commit gabungan lokal.
+          version="/$(git log -1 --abbrev=8 --pretty=format:%h upstream/master | cut -c1-8)/$(git log -1 --pretty=format:%ct upstream/master)"
+          echo "VELOREN_GIT_VERSION=$version" >> "$GITHUB_ENV"
+          {
+            echo "### Versi yang dibuild"
+            git log -1 --date=iso --pretty='Veloren resmi: `%h` (%cd) %s' upstream/master
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Kunci debug yang sama di setiap build, agar APK baru bisa menimpa yang lama.
+      - uses: actions/cache@v4
+        id: keystore
+        with:
+          path: .android-home/debug.keystore
+          key: voxygen-debug-keystore-v1
+
+      - name: Buat kunci debug (hanya pertama kali)
+        if: steps.keystore.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$ANDROID_USER_HOME"
+          keytool -genkeypair -keystore "$ANDROID_USER_HOME/debug.keystore" \
+            -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
 
       - uses: actions/setup-java@v4
         with:
@@ -69,6 +116,7 @@ jobs:
         with:
           workspaces: src
           shared-key: android-debug
+          cache-on-failure: true
 
       - name: Pasang cargo-ndk
         working-directory: src

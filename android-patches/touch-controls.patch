@@ -1,0 +1,484 @@
+diff --git a/assets/voxygen/i18n/en/hud/misc.ftl b/assets/voxygen/i18n/en/hud/misc.ftl
+index a4eb6f01..a4196e5c 100644
+--- a/assets/voxygen/i18n/en/hud/misc.ftl
++++ b/assets/voxygen/i18n/en/hud/misc.ftl
+@@ -150,3 +150,15 @@ hud-touch-chat = Chat
+ 
+ hud-touch-map = Map
+ hud-touch-swap = Swap weapons
++hud-touch-extra = Extra
++hud-touch-down = Down
++hud-touch-giveup = Give up
++hud-touch-type = Type
++hud-touch-crafting = Craft
++hud-touch-social = Social
++hud-touch-autowalk = Auto walk
++hud-touch-walk = Walk
++hud-touch-camera = Camera
++hud-touch-select = Target
++hud-touch-accept = Accept
++hud-touch-decline = Decline
+diff --git a/voxygen/src/hud/mod.rs b/voxygen/src/hud/mod.rs
+index 1a1fe2df..ae66b8fd 100755
+--- a/voxygen/src/hud/mod.rs
++++ b/voxygen/src/hud/mod.rs
+@@ -1402,9 +1402,12 @@ pub struct Hud {
+     /// taps.
+     #[cfg(target_os = "android")]
+     touch_regions: Vec<touch_buttons::Region>,
+-    /// Whether the phone's secondary touch buttons are shown ("More").
++    /// Which grids and skill slots the phone's touch buttons currently show.
+     #[cfg(target_os = "android")]
+-    touch_more_expanded: bool,
++    touch_view: touch_buttons::View,
++    /// Whether the soft keyboard was last requested for the chat input.
++    #[cfg(target_os = "android")]
++    ime_allowed: bool,
+ }
+ 
+ impl Hud {
+@@ -1522,7 +1525,9 @@ impl Hud {
+             #[cfg(target_os = "android")]
+             touch_regions: Vec::new(),
+             #[cfg(target_os = "android")]
+-            touch_more_expanded: false,
++            touch_view: Default::default(),
++            #[cfg(target_os = "android")]
++            ime_allowed: false,
+         }
+     }
+ 
+@@ -1553,9 +1558,10 @@ impl Hud {
+     #[cfg(target_os = "android")]
+     pub fn touch_regions(&self) -> &[touch_buttons::Region] { &self.touch_regions }
+ 
+-    /// Shows or hides the secondary touch buttons ("More").
++    /// The overlay's own state, changed by the "More", "Extra" and slot page
++    /// buttons.
+     #[cfg(target_os = "android")]
+-    pub fn toggle_touch_more(&mut self) { self.touch_more_expanded = !self.touch_more_expanded; }
++    pub fn touch_view_mut(&mut self) -> &mut touch_buttons::View { &mut self.touch_view }
+ 
+     #[expect(clippy::single_match)] // TODO: Pending review in #587
+     fn update_layout(
+@@ -1705,10 +1711,18 @@ impl Hud {
+                         // Dead players keep menus, but gameplay controls are
+                         // replaced by a dedicated respawn button on touch.
+                         dead: healths.get(me).is_some_and(|h| h.is_dead),
++                        downed: comp::is_downed(healths.get(me), char_state),
++                        swimming: ecs
++                            .read_storage::<comp::PhysicsState>()
++                            .get(me)
++                            .is_some_and(|physics| physics.in_liquid().is_some()),
++                        climbing: char_state
++                            .is_some_and(|cs| matches!(cs, comp::CharacterState::Climb(_))),
++                        has_invite: client.invite().is_some(),
+                     };
+                     let aspect = (ui_widgets.win_w / ui_widgets.win_h.max(1.0)) as f32;
+                     let shown =
+-                        touch_buttons::shown(&ctx, self.touch_more_expanded, aspect, |key| {
++                        touch_buttons::shown_in(&ctx, self.touch_view, aspect, |key| {
+                             i18n.get_msg(key).into_owned()
+                         });
+                     self.touch_regions = touch_buttons::regions(&shown);
+@@ -5521,6 +5535,17 @@ impl Hud {
+             camera,
+             interactable_map,
+         );
++
++        // Show the soft keyboard while the chat input has focus. Only on change,
++        // so the keyboard isn't re-requested every frame.
++        #[cfg(target_os = "android")]
++        {
++            let typing = self.typing();
++            if typing != self.ime_allowed {
++                self.ime_allowed = typing;
++                global_state.window.window().set_ime_allowed(typing);
++            }
++        }
+         let camera::Dependents {
+             view_mat, proj_mat, ..
+         } = camera.dependents();
+diff --git a/voxygen/src/hud/touch_buttons.rs b/voxygen/src/hud/touch_buttons.rs
+index 634ddc47..95a10aa9 100644
+--- a/voxygen/src/hud/touch_buttons.rs
++++ b/voxygen/src/hud/touch_buttons.rs
+@@ -38,6 +38,24 @@ pub enum Kind {
+     Input(GameInput),
+     /// Shows or hides the context grid.
+     More,
++    /// Shows or hides the grid of less frequent actions.
++    Extra,
++    /// Switches the five skill buttons between slots 1-5 and 6-10.
++    SlotPage,
++}
++
++/// The inputs a button sends. A keyboard binds several actions to one key (Space
++/// is both jump and swim up, Shift is sneak, swim down and letting go of a
++/// wall), so a button has to send all of them.
++pub fn inputs(input: GameInput) -> impl Iterator<Item = GameInput> {
++    let companions: &[GameInput] = match input {
++        GameInput::Jump => &[GameInput::SwimUp, GameInput::WallJump],
++        GameInput::Sneak | GameInput::SwimDown => {
++            &[GameInput::SwimDown, GameInput::CancelClimb]
++        },
++        _ => &[],
++    };
++    std::iter::once(input).chain(companions.iter().copied().filter(move |&c| c != input))
+ }
+ 
+ /// Facts about the player that decide which actions are offered.
+@@ -76,6 +94,12 @@ pub struct Context {
+     pub zoom_locked: bool,
+     /// The character has died; keep only menus and the respawn control visible.
+     pub dead: bool,
++    /// The character is knocked down and may give up.
++    pub downed: bool,
++    pub swimming: bool,
++    pub climbing: bool,
++    /// A group or trade invitation is waiting for an answer.
++    pub has_invite: bool,
+ }
+ 
+ /// Describes one context action before its text is localised.
+@@ -426,8 +450,161 @@ const FIXED: [Fixed; 14] = [
+     },
+ ];
+ 
++/// Actions of the "Extra" grid, in slot order. The invitation answers come last
++/// so that the others do not move when an invitation arrives.
++const EXTRA_ACTIONS: [(GameInput, &str); 9] = [
++    (GameInput::Chat, "hud-touch-type"),
++    (GameInput::Crafting, "hud-touch-crafting"),
++    (GameInput::Social, "hud-touch-social"),
++    (GameInput::AutoWalk, "hud-touch-autowalk"),
++    (GameInput::ToggleWalk, "hud-touch-walk"),
++    (GameInput::CycleCamera, "hud-touch-camera"),
++    (GameInput::Select, "hud-touch-select"),
++    (GameInput::AcceptGroupInvite, "hud-touch-accept"),
++    (GameInput::DeclineGroupInvite, "hud-touch-decline"),
++];
++
++/// Left-hand lane of the buttons outside the menu and skill-slot lanes.
++const LANE_TOGGLE: f32 = 0.09;
++
++/// Widget slots of the buttons added after the respawn button.
++const SLOT_EXTRA_TOGGLE: usize = 1 + FIXED.len() + CONTEXT_SLOTS + DEATH_SLOTS;
++const SLOT_PAGE_TOGGLE: usize = SLOT_EXTRA_TOGGLE + 1;
++/// Give up while downed, or move down while swimming or climbing.
++const SLOT_STATE: usize = SLOT_PAGE_TOGGLE + 1;
++const SLOT_EXTRA_FIRST: usize = SLOT_STATE + 1;
++
+ /// Total number of button slots; used to size the widget ids.
+-pub const COUNT: usize = 1 + FIXED.len() + CONTEXT_SLOTS + DEATH_SLOTS;
++pub const COUNT: usize = SLOT_EXTRA_FIRST + EXTRA_ACTIONS.len();
++
++/// What the player has opened or switched on the overlay itself.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct View {
++    /// The "More" grid is open.
++    pub more: bool,
++    /// The "Extra" grid is open. Never together with `more`.
++    pub extra: bool,
++    /// The skill buttons act on slots 6-10.
++    pub second_slots: bool,
++}
++
++impl View {
++    pub fn toggle_more(&mut self) {
++        self.more = !self.more;
++        self.extra = false;
++    }
++
++    pub fn toggle_extra(&mut self) {
++        self.extra = !self.extra;
++        self.more = false;
++    }
++
++    pub fn toggle_slot_page(&mut self) { self.second_slots = !self.second_slots; }
++}
++
++/// The skill input and symbol that a slot button has on the second page.
++fn second_page(input: GameInput) -> Option<(GameInput, &'static str)> {
++    match input {
++        GameInput::Slot1 => Some((GameInput::Slot6, "6")),
++        GameInput::Slot2 => Some((GameInput::Slot7, "7")),
++        GameInput::Slot3 => Some((GameInput::Slot8, "8")),
++        GameInput::Slot4 => Some((GameInput::Slot9, "9")),
++        GameInput::Slot5 => Some((GameInput::Slot10, "10")),
++        _ => None,
++    }
++}
++
++/// Returns the buttons to show for the current state and overlay view.
++///
++/// `aspect` is the window width divided by its height.
++pub fn shown_in(
++    ctx: &Context,
++    view: View,
++    aspect: f32,
++    localize: impl Fn(&str) -> String,
++) -> Vec<Shown> {
++    let mut buttons = shown(ctx, view.more, aspect, &localize);
++    if view.second_slots {
++        for button in &mut buttons {
++            if let Some(Kind::Input(input)) = button.action
++                && let Some((input, symbol)) = second_page(input)
++            {
++                button.action = Some(Kind::Input(input));
++                button.label = symbol.to_owned();
++            }
++        }
++    }
++    if ctx.dead {
++        return buttons;
++    }
++    buttons.push(Shown {
++        index: SLOT_EXTRA_TOGGLE,
++        action: Some(Kind::Extra),
++        center: center_of(Side::Left, LANE_TOGGLE, ROW_MENU, aspect),
++        diameter: D_MENU,
++        label: localize(if view.extra {
++            "hud-touch-less"
++        } else {
++            "hud-touch-extra"
++        }),
++        active: view.extra,
++    });
++    buttons.push(Shown {
++        index: SLOT_PAGE_TOGGLE,
++        action: Some(Kind::SlotPage),
++        center: center_of(Side::Left, LANE_TOGGLE, ROW_SLOT, aspect),
++        diameter: D_SLOT,
++        label: if view.second_slots { "1-5" } else { "6-10" }.to_owned(),
++        active: view.second_slots,
++    });
++    let state_button = if !ctx.controlling || ctx.riding {
++        None
++    } else if ctx.downed {
++        Some((GameInput::GiveUp, "hud-touch-giveup"))
++    } else if ctx.swimming || ctx.climbing {
++        Some((GameInput::SwimDown, "hud-touch-down"))
++    } else {
++        None
++    };
++    if let Some((input, key)) = state_button {
++        let lane = if aspect < NARROW_GRID_MAX_ASPECT {
++            LANE_INNER_NARROW
++        } else {
++            LANE_INNER
++        };
++        buttons.push(Shown {
++            index: SLOT_STATE,
++            action: Some(Kind::Input(input)),
++            center: center_of(Side::Right, lane, ROW_HIGH, aspect),
++            diameter: D_SMALL,
++            label: localize(key),
++            active: false,
++        });
++    }
++    if view.extra {
++        for (slot, (input, key)) in EXTRA_ACTIONS.into_iter().enumerate() {
++            let invite_answer = matches!(
++                input,
++                GameInput::AcceptGroupInvite | GameInput::DeclineGroupInvite
++            );
++            if invite_answer && !ctx.has_invite {
++                continue;
++            }
++            let Some(placement) = context_slot(slot, true, aspect, EXPANDED_GRID_SLOTS) else {
++                continue;
++            };
++            buttons.push(Shown {
++                index: SLOT_EXTRA_FIRST + slot,
++                action: Some(Kind::Input(input)),
++                center: center_of(Side::Right, placement.lane, placement.row, aspect),
++                diameter: placement.diameter,
++                label: localize(key),
++                active: false,
++            });
++        }
++    }
++    buttons
++}
+ 
+ /// A button to draw this frame, with its label already localised.
+ pub struct Shown {
+@@ -774,6 +951,10 @@ mod tests {
+             dancing: true,
+             zoom_locked: false,
+             dead: false,
++            downed: false,
++            swimming: true,
++            climbing: false,
++            has_invite: true,
+         }
+     }
+ 
+@@ -1254,4 +1435,74 @@ mod tests {
+         assert_eq!(contexts(&closed), TIER_SLOTS);
+         assert_eq!(contexts(&open), CONTEXT_SLOTS);
+     }
++
++    #[test]
++    fn added_buttons_do_not_overlap_or_leave_the_screen() {
++        for (name, ctx) in contexts() {
++            for aspect in ASPECTS {
++                for (more, extra, second_slots) in [
++                    (false, false, false),
++                    (true, false, true),
++                    (false, true, false),
++                    (false, true, true),
++                ] {
++                    let view = View {
++                        more,
++                        extra,
++                        second_slots,
++                    };
++                    let buttons: Vec<_> = shown_in(&ctx, view, aspect, str::to_owned)
++                        .into_iter()
++                        .map(|b| (b.index, b.center.x * aspect, b.center.y, b.diameter / 2.0))
++                        .collect();
++                    let state = format!("{name} at {aspect:.2} {view:?}");
++                    assert_apart(&buttons, &state);
++                    for (index, x, y, radius) in buttons {
++                        assert!(index < COUNT);
++                        assert!(x - radius >= 0.0 && x + radius <= aspect, "{index} {state}");
++                        assert!(y - radius >= 0.0 && y + radius <= 1.0, "{index} {state}");
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn every_hotbar_slot_and_window_is_reachable() {
++        let ctx = full_context();
++        let mut view = View::default();
++        view.toggle_slot_page();
++        view.toggle_extra();
++        let buttons = shown_in(&ctx, view, 16.0 / 9.0, str::to_owned);
++        for input in [
++            GameInput::Slot6,
++            GameInput::Slot10,
++            GameInput::Chat,
++            GameInput::Crafting,
++            GameInput::Social,
++            GameInput::SwimDown,
++        ] {
++            assert!(has_input(&buttons, input), "missing {input:?}");
++        }
++        assert!(!has_input(&buttons, GameInput::Slot1));
++    }
++
++    #[test]
++    fn buttons_send_everything_the_matching_key_would() {
++        let jump: Vec<_> = inputs(GameInput::Jump).collect();
++        assert!(jump.contains(&GameInput::SwimUp) && jump.contains(&GameInput::WallJump));
++        let down: Vec<_> = inputs(GameInput::SwimDown).collect();
++        assert_eq!(down, vec![GameInput::SwimDown, GameInput::CancelClimb]);
++    }
++
++    #[test]
++    fn downed_players_are_offered_give_up() {
++        let ctx = Context {
++            downed: true,
++            ..full_context()
++        };
++        let buttons = shown_in(&ctx, View::default(), 16.0 / 9.0, str::to_owned);
++        assert!(has_input(&buttons, GameInput::GiveUp));
++        assert!(!has_input(&buttons, GameInput::SwimDown));
++    }
+ }
+diff --git a/voxygen/src/session/mod.rs b/voxygen/src/session/mod.rs
+index 014da0ae..b14dada2 100644
+--- a/voxygen/src/session/mod.rs
++++ b/voxygen/src/session/mod.rs
+@@ -103,8 +103,8 @@ enum AndroidTouchControl {
+         last: Vec2<f32>,
+     },
+     Button(GameInput),
+-    /// The "More" button. Acts on press only and sends no input.
+-    More,
++    /// A button that only changes the overlay. Acts on press and sends no input.
++    Overlay,
+ }
+ 
+ /// Returns the touch button under `position`. The buttons come from the HUD,
+@@ -260,10 +260,14 @@ impl SessionState {
+                         .window
+                         .send_event(Event::AnalogGameInput(AnalogGameInput::MovementY(0.0)));
+                 },
+-                AndroidTouchControl::Button(button) => global_state
+-                    .window
+-                    .send_event(Event::InputUpdate(button, false)),
+-                AndroidTouchControl::More | AndroidTouchControl::Look { .. } => {},
++                AndroidTouchControl::Button(button) => {
++                    for input in crate::hud::touch_buttons::inputs(button) {
++                        global_state
++                            .window
++                            .send_event(Event::InputUpdate(input, false));
++                    }
++                },
++                AndroidTouchControl::Overlay | AndroidTouchControl::Look { .. } => {},
+             }
+         }
+     }
+@@ -299,14 +303,24 @@ impl SessionState {
+                 {
+                     match action {
+                         Kind::Input(button) => {
+-                            global_state
+-                                .window
+-                                .send_event(Event::InputUpdate(button, true));
++                            for input in crate::hud::touch_buttons::inputs(button) {
++                                global_state
++                                    .window
++                                    .send_event(Event::InputUpdate(input, true));
++                            }
+                             AndroidTouchControl::Button(button)
+                         },
+                         Kind::More => {
+-                            self.hud.toggle_touch_more();
+-                            AndroidTouchControl::More
++                            self.hud.touch_view_mut().toggle_more();
++                            AndroidTouchControl::Overlay
++                        },
++                        Kind::Extra => {
++                            self.hud.touch_view_mut().toggle_extra();
++                            AndroidTouchControl::Overlay
++                        },
++                        Kind::SlotPage => {
++                            self.hud.touch_view_mut().toggle_slot_page();
++                            AndroidTouchControl::Overlay
+                         },
+                     }
+                 } else if position.x < width * 0.42 && position.y > height * 0.32 {
+@@ -355,7 +369,7 @@ impl SessionState {
+                                 delta.y * sensitivity * invert_y,
+                             )));
+                         },
+-                        AndroidTouchControl::Button(_) | AndroidTouchControl::More => {},
++                        AndroidTouchControl::Button(_) | AndroidTouchControl::Overlay => {},
+                     }
+                 }
+             },
+@@ -370,10 +384,14 @@ impl SessionState {
+                                 AnalogGameInput::MovementY(0.0),
+                             ));
+                         },
+-                        AndroidTouchControl::Button(button) => global_state
+-                            .window
+-                            .send_event(Event::InputUpdate(button, false)),
+-                        AndroidTouchControl::More | AndroidTouchControl::Look { .. } => {},
++                        AndroidTouchControl::Button(button) => {
++                            for input in crate::hud::touch_buttons::inputs(button) {
++                                global_state
++                                    .window
++                                    .send_event(Event::InputUpdate(input, false));
++                            }
++                        },
++                        AndroidTouchControl::Overlay | AndroidTouchControl::Look { .. } => {},
+                     }
+                 }
+             },
