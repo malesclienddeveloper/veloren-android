@@ -1,0 +1,61 @@
+# Mengecek tag `weekly` Veloren resmi secara berkala. Kalau berbeda dari APK
+# terbaru di Releases, APK baru dibuild dari branch android-test.
+name: Cek update Veloren
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      paksa:
+        description: Build walaupun versinya sama
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cek-update-veloren
+
+jobs:
+  cek:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      perlu: ${{ steps.banding.outputs.perlu }}
+    env:
+      HAS_SIGNING_KEY: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 != '' }}
+    steps:
+      - name: Bandingkan versi
+        id: banding
+        env:
+          PAKSA: ${{ inputs.paksa }}
+        run: |
+          set -euo pipefail
+          resmi="$(git ls-remote https://gitlab.com/veloren/veloren.git \
+            'refs/tags/weekly' 'refs/tags/weekly^{}' | sort -k2 | tail -n1 | cut -f1)"
+          test -n "$resmi"
+          # Kosong kalau belum pernah ada rilis.
+          terbit="$(curl -fsSL --retry 3 \
+            "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/version.properties" \
+            | sed -n 's/^commit=//p' || true)"
+          echo "Weekly resmi: $resmi"
+          echo "APK terbit : ${terbit:-belum ada}"
+          perlu=false
+          if [ "$HAS_SIGNING_KEY" != "true" ]; then
+            echo "::warning::Secret ANDROID_DEBUG_KEYSTORE_BASE64 belum diisi, build dilewati."
+          elif [ "$resmi" != "$terbit" ] || [ "$PAKSA" = "true" ]; then
+            perlu=true
+          fi
+          echo "perlu=$perlu" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: cek
+    if: needs.cek.outputs.perlu == 'true'
+    permissions:
+      contents: write
+    uses: malesclienddeveloper/veloren-android/.github/workflows/voxygen-apk.yml@android-test
+    with:
+      kit_ref: android-test
+    secrets: inherit
