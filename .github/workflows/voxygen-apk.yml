@@ -28,54 +28,53 @@ jobs:
           path: kit
           persist-credentials: false
 
-      - name: Checkout kode game dan aset LFS
+      - name: Checkout port Android (fork)
         uses: actions/checkout@v4
         with:
           repository: ejir/veloren
           ref: f7f1684ddf9b44928af810964f11321692c8cf7b
           path: src
-          lfs: true
-          # Riwayat penuh untuk mencari merge-base. Jangan pakai partial clone
-          # (filter): git-lfs gagal memindai file di clone seperti itu.
+          # Riwayat penuh agar commit dasar port tersedia. Jangan pakai partial
+          # clone (filter): git-lfs gagal memindai file di clone seperti itu.
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Terapkan patch Android
+      - name: Pasang port Android di atas Veloren resmi terbaru
         working-directory: src
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+          # Commit upstream yang menjadi dasar fork.
+          PORT_BASE: 648ec121ee78815d8c5288ec1ec648893ef20cdd
         run: |
           git config user.name "android-build"
           git config user.email "android-build@users.noreply.github.com"
           git apply --index --verbose ../kit/android-patches/*.patch
           git commit -qm "android patches"
+          port="$(git rev-parse HEAD)"
+          git diff --binary --full-index "$PORT_BASE" "$port" > "$RUNNER_TEMP/port.diff"
 
-      - name: Gabungkan Veloren resmi terbaru
-        working-directory: src
-        env:
-          GIT_LFS_SKIP_SMUDGE: "1"
-        run: |
+          # Hash commit di GitLab berbeda dari fork di GitHub, jadi tidak bisa
+          # di-merge. Selisih port diterapkan dengan 3-way di atas master resmi.
+          # HEAD tetap commit resmi, sehingga versi yang dilaporkan ke server asli.
           git remote add upstream https://gitlab.com/veloren/veloren.git
           git fetch upstream master
-          echo "shallow: $(git rev-parse --is-shallow-repository)"
-          echo "--- upstream"; git log -5 --date=iso --pretty='%h %cd %s' upstream/master
-          echo "--- fork";     git log -5 --date=iso --pretty='%h %cd %s' HEAD
-          echo "merge-base: $(git merge-base HEAD upstream/master || echo TIDAK ADA)"
-          echo "root upstream: $(git rev-list --max-parents=0 upstream/master | head -3 | tr '\n' ' ')"
-          echo "root fork: $(git rev-list --max-parents=0 HEAD | head -3 | tr '\n' ' ')"
+          git checkout -q --detach upstream/master
           # Gagal di sini berarti ada konflik antara update resmi dan port Android.
-          git merge --no-edit upstream/master
-          git lfs fetch upstream "$(git rev-parse upstream/master)"
+          git apply --3way --index "$RUNNER_TEMP/port.diff"
+
+          git lfs install --local
+          git lfs fetch upstream "$(git rev-parse HEAD)"
+          # Berkas LFS yang hanya ada di port (kalau ada) diambil dari fork.
+          changed="$(git diff --cached --name-only "HEAD" | paste -sd, -)"
+          git lfs fetch origin "$port" --include="$changed" --exclude=""
           git lfs checkout
-          # Pastikan tidak ada aset yang masih berupa pointer LFS.
           missing="$(git lfs ls-files | awk '$2 == "-"')"
           if [ -n "$missing" ]; then
             echo "::error::Aset LFS belum terunduh:"; echo "$missing" | head -20; exit 1
           fi
-          # Laporkan versi resmi ke server, bukan hash commit gabungan lokal.
-          version="/$(git log -1 --abbrev=8 --pretty=format:%h upstream/master | cut -c1-8)/$(git log -1 --pretty=format:%ct upstream/master)"
-          echo "VELOREN_GIT_VERSION=$version" >> "$GITHUB_ENV"
           {
             echo "### Versi yang dibuild"
-            git log -1 --date=iso --pretty='Veloren resmi: `%h` (%cd) %s' upstream/master
+            git log -1 --date=iso --pretty='Veloren resmi: `%h` (%cd) %s'
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Kunci debug yang sama di setiap build, agar APK baru bisa menimpa yang lama.
