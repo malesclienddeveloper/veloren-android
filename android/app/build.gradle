@@ -27,6 +27,15 @@ android {
         }
     }
 
+    signingConfigs {
+        release {
+            storeFile rootProject.file("release.keystore")
+            storePassword "anotherr"
+            keyAlias "androiddebugkey"
+            keyPassword "anotherr"
+        }
+    }
+
     buildTypes {
         release {
             signingConfig signingConfigs.release
