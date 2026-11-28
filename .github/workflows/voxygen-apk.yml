@@ -35,8 +35,9 @@ jobs:
           ref: f7f1684ddf9b44928af810964f11321692c8cf7b
           path: src
           lfs: true
+          # Riwayat penuh untuk mencari merge-base. Jangan pakai partial clone
+          # (filter): git-lfs gagal memindai file di clone seperti itu.
           fetch-depth: 0
-          filter: blob:none
           persist-credentials: false
 
       - name: Terapkan patch Android
@@ -53,7 +54,7 @@ jobs:
           GIT_LFS_SKIP_SMUDGE: "1"
         run: |
           git remote add upstream https://gitlab.com/veloren/veloren.git
-          git fetch --filter=blob:none upstream master
+          git fetch upstream master
           # Gagal di sini berarti ada konflik antara update resmi dan port Android.
           git merge --no-edit upstream/master
           git lfs fetch upstream "$(git rev-parse upstream/master)"
