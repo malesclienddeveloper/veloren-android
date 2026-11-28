@@ -37,7 +37,7 @@ jobs:
 
       - name: Terapkan patch
         working-directory: src
-        run: git apply --verbose ../kit/android-patches/depthclamp-optional.patch
+        run: git apply --verbose ../kit/android-patches/*.patch
 
       - uses: actions/setup-java@v4
         with:

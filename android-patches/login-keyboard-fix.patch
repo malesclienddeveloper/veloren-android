@@ -1,0 +1,39 @@
+diff --git a/voxygen/src/menu/main/ui/credentials.rs b/voxygen/src/menu/main/ui/credentials.rs
+index f0c77a57..22ecea9b 100644
+--- a/voxygen/src/menu/main/ui/credentials.rs
++++ b/voxygen/src/menu/main/ui/credentials.rs
+@@ -184,6 +184,12 @@ impl Prompt {
+             .into()
+     }
+ 
++    /// Whether one of the prompt's text fields is focused.
++    #[cfg(target_os = "android")]
++    pub(super) fn is_focused(&self) -> bool {
++        self.username.is_focused() || self.password.is_focused()
++    }
++
+     pub(super) fn focus_username(&mut self) {
+         self.password = text_input::State::new();
+         self.username = text_input::State::focused();
+diff --git a/voxygen/src/menu/main/ui/mod.rs b/voxygen/src/menu/main/ui/mod.rs
+index 16ac23b5..bd8ee6c5 100644
+--- a/voxygen/src/menu/main/ui/mod.rs
++++ b/voxygen/src/menu/main/ui/mod.rs
+@@ -895,11 +895,12 @@ impl MainMenuUi {
+         #[cfg(target_os = "android")]
+         {
+             let ime_wanted = match &self.controls.screen {
+-                Screen::Login { screen, .. } => {
+-                    screen.banner.username.is_focused()
+-                        || screen.banner.password.is_focused()
+-                        || screen.banner.server.is_focused()
+-                },
++                Screen::Login { screen, .. } => screen.banner.server.is_focused(),
++                Screen::Connecting {
++                    screen,
++                    connection_state: ConnectionState::CredentialsPrompt { .. },
++                    ..
++                } => screen.credentials.is_focused(),
+                 _ => false,
+             };
+             if ime_wanted != self.ime_allowed {
