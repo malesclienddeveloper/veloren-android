@@ -1,0 +1,52 @@
+diff --git a/voxygen/src/settings/graphics.rs b/voxygen/src/settings/graphics.rs
+index ad792cb7a..6a347b296 100644
+--- a/voxygen/src/settings/graphics.rs
++++ b/voxygen/src/settings/graphics.rs
+@@ -106,6 +106,34 @@ impl GraphicsSettings {
+         }
+     }
+ 
++    /// Default for phones: lighter than `into_low`. A phone GPU and CPU run well
++    /// below even a low-end desktop, and a steady 30 FPS is better than a
++    /// framerate that swings. Players can raise any of this in the settings.
++    pub fn into_android(self) -> Self {
++        use crate::render::*;
++        let low = self.into_low();
++        Self {
++            terrain_view_distance: 5,
++            entity_view_distance: 5,
++            lod_distance: 50,
++            sprite_render_distance: 80,
++            figure_lod_render_distance: 120,
++            lod_detail: 120,
++            particles_chance: 0.1,
++            weapon_trails_enabled: false,
++            max_fps: Fps::Max(30),
++            render_mode: RenderMode {
++                cloud: CloudMode::Flat,
++                reflection: ReflectionMode::Low,
++                rain_enabled: false,
++                point_glow: 0.0,
++                upscale_mode: UpscaleMode { factor: 0.5 },
++                ..low.render_mode
++            },
++            ..low
++        }
++    }
++
+     pub fn into_low(self) -> Self {
+         use crate::render::*;
+         Self {
+diff --git a/voxygen/src/settings/mod.rs b/voxygen/src/settings/mod.rs
+index eefe86041..22a09c2ea 100644
+--- a/voxygen/src/settings/mod.rs
++++ b/voxygen/src/settings/mod.rs
+@@ -86,7 +86,7 @@ impl Default for Settings {
+             gameplay: GameplaySettings::default(),
+             networking: NetworkingSettings::default(),
+             #[cfg(target_os = "android")]
+-            graphics: GraphicsSettings::default().into_low(),
++            graphics: GraphicsSettings::default().into_android(),
+             #[cfg(not(target_os = "android"))]
+             graphics: GraphicsSettings::default(),
+             audio: AudioSettings::default(),

@@ -1,0 +1,67 @@
+diff --git a/voxygen/src/hud/mod.rs b/voxygen/src/hud/mod.rs
+index 1a1fe2df3..258e26b84 100755
+--- a/voxygen/src/hud/mod.rs
++++ b/voxygen/src/hud/mod.rs
+@@ -301,6 +301,8 @@ widget_ids! {
+         // Debug
+         debug_bg,
+         fps_counter,
++        fps_overlay_bg,
++        fps_overlay,
+         ping,
+         coordinates,
+         velocity,
+@@ -2923,6 +2925,32 @@ impl Hud {
+             }
+         }
+ 
++        // Compact FPS counter. The full debug window already shows the framerate,
++        // so this is only drawn while that window is closed.
++        if global_state.settings.interface.show_fps && debug_info.is_none() {
++            let stats = global_state.clock.stats();
++            let frame_ms = stats.average_busy_dt.as_millis();
++            let text = format!("{:.0} FPS ({} ms)", fps, frame_ms);
++            // Red below 20 FPS, yellow below 40, green otherwise.
++            let color = if fps < 20.0 {
++                Color::Rgba(1.0, 0.35, 0.35, 1.0)
++            } else if fps < 40.0 {
++                Color::Rgba(1.0, 0.85, 0.3, 1.0)
++            } else {
++                Color::Rgba(0.45, 1.0, 0.5, 1.0)
++            };
++            Rectangle::fill([130.0, 22.0])
++                .rgba(0.0, 0.0, 0.0, 0.45)
++                .mid_top_with_margin_on(ui_widgets.window, 4.0)
++                .set(self.ids.fps_overlay_bg, ui_widgets);
++            Text::new(&text)
++                .color(color)
++                .middle_of(self.ids.fps_overlay_bg)
++                .font_id(self.fonts.cyri.conrod_id)
++                .font_size(self.fonts.cyri.scale(14))
++                .set(self.ids.fps_overlay, ui_widgets);
++        }
++
+         // Display debug window.
+         // TODO:
+         // Make it use i18n keys.
+diff --git a/voxygen/src/settings/interface.rs b/voxygen/src/settings/interface.rs
+index 07b9c9a90..62996876a 100644
+--- a/voxygen/src/settings/interface.rs
++++ b/voxygen/src/settings/interface.rs
+@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
+ pub struct InterfaceSettings {
+     pub use_secure_service: bool,
+     pub toggle_debug: bool,
++    /// Compact FPS counter (on by default on Android, where F3 is not available).
++    pub show_fps: bool,
+     pub toggle_egui_debug: bool,
+     pub toggle_hitboxes: bool,
+     pub toggle_chat: bool,
+@@ -70,6 +72,7 @@ impl Default for InterfaceSettings {
+         Self {
+             use_secure_service: false,
+             toggle_debug: false,
++            show_fps: cfg!(target_os = "android"),
+             toggle_egui_debug: false,
+             toggle_hitboxes: false,
+             toggle_chat: !cfg!(target_os = "android"),
