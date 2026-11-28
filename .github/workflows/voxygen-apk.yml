@@ -1,0 +1,89 @@
+# Build APK debug Voxygen asli: kode game dari fork ejir/veloren (commit dipatok)
+# ditambah patch di android-patches/.
+name: Build Voxygen APK
+
+on:
+  push:
+    branches: [android-test]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+    steps:
+      # Dua checkout di folder terpisah, supaya .cargo/config.toml repo ini
+      # tidak ikut memengaruhi build di src/.
+      - name: Checkout patch
+        uses: actions/checkout@v4
+        with:
+          path: kit
+          persist-credentials: false
+
+      - name: Checkout kode game dan aset LFS
+        uses: actions/checkout@v4
+        with:
+          repository: ejir/veloren
+          ref: f7f1684ddf9b44928af810964f11321692c8cf7b
+          path: src
+          lfs: true
+          persist-credentials: false
+
+      - name: Terapkan patch
+        working-directory: src
+        run: git apply --verbose ../kit/android-patches/depthclamp-optional.patch
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: ""
+          accept-android-sdk-licenses: false
+
+      - name: Pasang Android SDK, CMake, dan NDK
+        shell: bash
+        run: |
+          set +o pipefail
+          yes | sdkmanager --licenses
+          set -o pipefail
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" \
+            "platform-tools" "cmake;3.22.1" "ndk;28.0.13004108"
+
+      - name: Pasang toolchain Rust sesuai rust-toolchain
+        working-directory: src
+        shell: bash
+        run: |
+          toolchain="$(tr -d '\r\n' < rust-toolchain)"
+          rustup toolchain install "$toolchain" --profile minimal --target aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+          shared-key: android-debug
+
+      - name: Pasang cargo-ndk
+        working-directory: src
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Build APK debug
+        working-directory: src/android
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veloren-voxygen-debug
+          path: src/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

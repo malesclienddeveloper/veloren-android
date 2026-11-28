@@ -1,0 +1,110 @@
+diff --git a/voxygen/src/render/pipelines/debug.rs b/voxygen/src/render/pipelines/debug.rs
+index a99ee15a..d1541fac 100644
+--- a/voxygen/src/render/pipelines/debug.rs
++++ b/voxygen/src/render/pipelines/debug.rs
+@@ -104,7 +104,9 @@ impl DebugPipeline {
+                 strip_index_format: None,
+                 front_face: wgpu::FrontFace::Ccw,
+                 cull_mode: Some(wgpu::Face::Back),
+-                unclipped_depth: true,
++                unclipped_depth: device
++                    .features()
++                    .contains(wgpu::Features::DEPTH_CLIP_CONTROL),
+                 polygon_mode: wgpu::PolygonMode::Fill,
+                 conservative: false,
+             },
+diff --git a/voxygen/src/render/pipelines/rain_occlusion.rs b/voxygen/src/render/pipelines/rain_occlusion.rs
+index 9c744a9a..01cac8ff 100644
+--- a/voxygen/src/render/pipelines/rain_occlusion.rs
++++ b/voxygen/src/render/pipelines/rain_occlusion.rs
+@@ -119,7 +119,9 @@ impl RainOcclusionFigurePipeline {
+                 strip_index_format: None,
+                 front_face: wgpu::FrontFace::Ccw,
+                 cull_mode: Some(wgpu::Face::Back),
+-                unclipped_depth: true,
++                unclipped_depth: device
++                    .features()
++                    .contains(wgpu::Features::DEPTH_CLIP_CONTROL),
+                 polygon_mode: wgpu::PolygonMode::Fill,
+                 conservative: false,
+             },
+@@ -190,7 +192,9 @@ impl RainOcclusionPipeline {
+                 strip_index_format: None,
+                 front_face: wgpu::FrontFace::Ccw,
+                 cull_mode: None,
+-                unclipped_depth: true,
++                unclipped_depth: device
++                    .features()
++                    .contains(wgpu::Features::DEPTH_CLIP_CONTROL),
+                 polygon_mode: wgpu::PolygonMode::Fill,
+                 conservative: false,
+             },
+diff --git a/voxygen/src/render/pipelines/shadow.rs b/voxygen/src/render/pipelines/shadow.rs
+index 5d1638fc..588addb4 100644
+--- a/voxygen/src/render/pipelines/shadow.rs
++++ b/voxygen/src/render/pipelines/shadow.rs
+@@ -116,7 +116,9 @@ impl ShadowFigurePipeline {
+                 strip_index_format: None,
+                 front_face: wgpu::FrontFace::Ccw,
+                 cull_mode: Some(wgpu::Face::Front),
+-                unclipped_depth: true,
++                unclipped_depth: device
++                    .features()
++                    .contains(wgpu::Features::DEPTH_CLIP_CONTROL),
+                 polygon_mode: wgpu::PolygonMode::Fill,
+                 conservative: false,
+             },
+@@ -187,7 +189,9 @@ impl ShadowPipeline {
+                 strip_index_format: None,
+                 front_face: wgpu::FrontFace::Ccw,
+                 cull_mode: Some(wgpu::Face::Front),
+-                unclipped_depth: true,
++                unclipped_depth: device
++                    .features()
++                    .contains(wgpu::Features::DEPTH_CLIP_CONTROL),
+                 polygon_mode: wgpu::PolygonMode::Fill,
+                 conservative: false,
+             },
+@@ -331,7 +335,9 @@ impl ShadowDebugPipeline {
+                 strip_index_format: None,
+                 front_face: wgpu::FrontFace::Ccw,
+                 cull_mode: Some(wgpu::Face::Front),
+-                unclipped_depth: true,
++                unclipped_depth: device
++                    .features()
++                    .contains(wgpu::Features::DEPTH_CLIP_CONTROL),
+                 polygon_mode: wgpu::PolygonMode::Fill,
+                 conservative: false,
+             },
+diff --git a/voxygen/src/render/renderer/mod.rs b/voxygen/src/render/renderer/mod.rs
+index 764df959..c460c7cb 100644
+--- a/voxygen/src/render/renderer/mod.rs
++++ b/voxygen/src/render/renderer/mod.rs
+@@ -330,7 +330,9 @@ impl Renderer {
+             runtime.block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                 // TODO
+                 label: None,
+-                required_features: wgpu::Features::DEPTH_CLIP_CONTROL
++                // `DEPTH_CLIP_CONTROL` needs Vulkan's `depthClamp`, which a number of
++                // mobile GPUs lack, so only ask for it when the adapter has it.
++                required_features: (adapter.features() & wgpu::Features::DEPTH_CLIP_CONTROL)
+                     | wgpu::Features::ADDRESS_MODE_CLAMP_TO_BORDER
+                     | wgpu::Features::PUSH_CONSTANTS
+                     // Only used for `ExperimentalShader::Wireframe`, so don't gate all builds on
+@@ -347,6 +349,16 @@ impl Renderer {
+                 trace: wgpu::Trace::Off,
+             }))?;
+ 
++        if !device
++            .features()
++            .contains(wgpu::Features::DEPTH_CLIP_CONTROL)
++        {
++            warn!(
++                "Depth clip control is not supported by this adapter, shadows and rain occlusion \
++                 may show artifacts"
++            );
++        }
++
+         // Set error handler for wgpu errors
+         // This is better for use than their default because it includes the error in
+         // the panic message
