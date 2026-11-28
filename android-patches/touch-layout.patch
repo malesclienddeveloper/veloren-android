@@ -1,0 +1,1168 @@
+diff --git a/voxygen/src/app.rs b/voxygen/src/app.rs
+index 928960df..a3121d51 100644
+--- a/voxygen/src/app.rs
++++ b/voxygen/src/app.rs
+@@ -124,6 +124,14 @@ pub fn run(
+ 
+     // Load the settings
+     let mut settings = Settings::load(&config_dir);
++    #[cfg(target_os = "android")]
++    if let Some(files) = android_app.internal_data_path() {
++        apply_launcher_graphics(
++            &files.join(crate::launcher_config::DIR),
++            &config_dir,
++            &mut settings,
++        );
++    }
+     settings.display_warnings();
+ 
+     panic_handler::set_panic_hook(log_filename, logs_dir);
+@@ -274,6 +282,48 @@ pub fn run(
+     run::run(global_state, event_loop).unwrap();
+ }
+ 
++/// Takes over graphics choices made in the launcher since the last start.
++#[cfg(target_os = "android")]
++fn apply_launcher_graphics(
++    launcher_dir: &std::path::Path,
++    config_dir: &std::path::Path,
++    settings: &mut Settings,
++) {
++    use crate::{launcher_config, render::ShadowMode, settings::Fps};
++
++    let choices = launcher_config::current().graphics;
++    if !launcher_config::graphics_pending(launcher_dir, &choices) {
++        return;
++    }
++    let graphics = &mut settings.graphics;
++    if let Some(factor) = choices.render_scale {
++        graphics.render_mode.upscale_mode.factor = factor;
++    }
++    if let Some(distance) = choices.view_distance {
++        graphics.terrain_view_distance = distance;
++        graphics.entity_view_distance = distance;
++    }
++    if let Some(fps) = choices.max_fps {
++        graphics.max_fps = Fps::Max(fps);
++    }
++    if let Some(shadows) = choices.shadows {
++        graphics.render_mode.shadow = if shadows {
++            ShadowMode::Cheap
++        } else {
++            ShadowMode::None
++        };
++    }
++    // Only remember the revision once the settings are safely on disk.
++    match settings.save_to_file(config_dir) {
++        Ok(()) => {
++            if let Err(error) = launcher_config::mark_graphics_applied(launcher_dir, &choices) {
++                warn!(?error, "Could not record the applied launcher graphics");
++            }
++        },
++        Err(error) => warn!(?error, "Could not save the launcher graphics"),
++    }
++}
++
+ #[cfg(target_os = "android")]
+ fn initialize_android_storage(app: &winit::platform::android::activity::AndroidApp) {
+     const APK_ASSET_ROOT: &str = "veloren-assets";
+diff --git a/voxygen/src/hud/mod.rs b/voxygen/src/hud/mod.rs
+index 7b4df2f9..128194af 100755
+--- a/voxygen/src/hud/mod.rs
++++ b/voxygen/src/hud/mod.rs
+@@ -1404,6 +1404,11 @@ pub struct Hud {
+     /// taps.
+     #[cfg(target_os = "android")]
+     touch_regions: Vec<touch_buttons::Region>,
++    #[cfg(target_os = "android")]
++    touch_move_zone: Option<touch_buttons::MoveZone>,
++    /// Button pictures provided by resource packs, by name.
++    #[cfg(target_os = "android")]
++    touch_images: HashMap<&'static str, conrod_core::image::Id>,
+     /// Which grids and skill slots the phone's touch buttons currently show.
+     #[cfg(target_os = "android")]
+     touch_view: touch_buttons::View,
+@@ -1446,6 +1451,17 @@ impl Hud {
+         let imgs = Imgs::load(&mut ui).expect("Failed to load images!");
+         // Load rotation images.
+         let rot_imgs = ImgsRot::load(&mut ui).expect("Failed to load rot images!");
++        // Resource packs may provide a picture for any of the touch buttons.
++        #[cfg(target_os = "android")]
++        let touch_images = touch_buttons::ICONS
++            .iter()
++            .filter_map(|&name| {
++                use common::assets::{AssetExt, Image};
++                let image = Image::load(&format!("voxygen.element.ui.touch.{name}")).ok()?;
++                let graphic = Graphic::Image(image.read().to_image(), None);
++                Some((name, ui.add_graphic(graphic)))
++            })
++            .collect();
+         // Load item images.
+         let item_imgs = ItemImgs::new(&mut ui, imgs.not_found);
+         // Load item text ("reference" to name and description)
+@@ -1527,6 +1543,10 @@ impl Hud {
+             #[cfg(target_os = "android")]
+             touch_regions: Vec::new(),
+             #[cfg(target_os = "android")]
++            touch_move_zone: None,
++            #[cfg(target_os = "android")]
++            touch_images,
++            #[cfg(target_os = "android")]
+             touch_view: Default::default(),
+             #[cfg(target_os = "android")]
+             ime_allowed: false,
+@@ -1560,6 +1580,10 @@ impl Hud {
+     #[cfg(target_os = "android")]
+     pub fn touch_regions(&self) -> &[touch_buttons::Region] { &self.touch_regions }
+ 
++    /// Where movement touches go this frame.
++    #[cfg(target_os = "android")]
++    pub fn touch_move_zone(&self) -> Option<touch_buttons::MoveZone> { self.touch_move_zone }
++
+     /// The overlay's own state, changed by the "More", "Extra" and slot page
+     /// buttons.
+     #[cfg(target_os = "android")]
+@@ -1636,6 +1660,7 @@ impl Hud {
+             #[cfg(target_os = "android")]
+             {
+                 self.touch_regions.clear();
++                self.touch_move_zone = None;
+                 if self.show.want_grab {
+                     let char_state = char_states.get(me);
+                     let inventory = inventories.get(me);
+@@ -1723,33 +1748,53 @@ impl Hud {
+                         has_invite: client.invite().is_some(),
+                     };
+                     let aspect = (ui_widgets.win_w / ui_widgets.win_h.max(1.0)) as f32;
+-                    let shown =
+-                        touch_buttons::shown_in(&ctx, self.touch_view, aspect, |key| {
+-                            i18n.get_msg(key).into_owned()
+-                        });
++                    let launcher = crate::launcher_config::current();
++                    let shown = touch_buttons::shown_for(
++                        &ctx,
++                        self.touch_view,
++                        aspect,
++                        launcher,
++                        |key| i18n.get_msg(key).into_owned(),
++                    );
+                     self.touch_regions = touch_buttons::regions(&shown);
++                    self.touch_move_zone = touch_buttons::move_zone(&ctx, aspect, launcher);
++                    let opacity = launcher.opacity;
+ 
+-                    if self.ids.android_touch_controls.len() < touch_buttons::COUNT * 2 {
++                    if self.ids.android_touch_controls.len() < touch_buttons::COUNT * 3 {
+                         self.ids.android_touch_controls.resize(
+-                            touch_buttons::COUNT * 2,
++                            touch_buttons::COUNT * 3,
+                             &mut ui_widgets.widget_id_generator(),
+                         );
+                     }
+-                    // Label widgets follow the backdrop widgets.
++                    // Label widgets follow the backdrop widgets, then pictures.
++                    // Each kind of widget needs ids of its own.
+                     let label_offset = touch_buttons::COUNT;
++                    let image_offset = touch_buttons::COUNT * 2;
+                     for button in &shown {
+                         let center = Vec2::new(
+                             (button.center.x as f64 - 0.5) * ui_widgets.win_w,
+                             (0.5 - button.center.y as f64) * ui_widgets.win_h,
+                         );
+                         let size = ui_widgets.win_h * button.diameter as f64;
++                        if let Some(&picture) = self.touch_images.get(button.icon) {
++                            let tint = if button.active { 0.65 } else { 1.0 };
++                            Image::new(picture)
++                                .w_h(size, size)
++                                .x_y(center.x, center.y)
++                                .color(Some(Color::Rgba(tint, 1.0, tint, 0.85 * opacity)))
++                                .set(
++                                    self.ids.android_touch_controls[button.index + image_offset],
++                                    ui_widgets,
++                                );
++                            continue;
++                        }
+                         let backdrop = if button.active {
+                             (0.20, 0.45, 0.25, 0.55)
+                         } else {
+                             (0.04, 0.07, 0.09, 0.38)
+                         };
+                         Rectangle::fill([size, size])
+-                            .rgba(backdrop.0, backdrop.1, backdrop.2, backdrop.3)
++                            .rgba(backdrop.0, backdrop.1, backdrop.2, backdrop.3 * opacity)
+                             .x_y(center.x, center.y)
+                             .set(self.ids.android_touch_controls[button.index], ui_widgets);
+                         // The label follows the size of its button, so the small
+@@ -1758,7 +1803,7 @@ impl Hud {
+                         Text::new(&button.label)
+                             .font_id(self.fonts.cyri.conrod_id)
+                             .font_size(self.fonts.cyri.scale(font_size))
+-                            .color(Color::Rgba(1.0, 1.0, 1.0, 0.8))
++                            .color(Color::Rgba(1.0, 1.0, 1.0, 0.8 * opacity))
+                             .x_y(center.x, center.y)
+                             .set(
+                                 self.ids.android_touch_controls[button.index + label_offset],
+@@ -5548,6 +5593,7 @@ impl Hud {
+             // not stay tappable either.
+             #[cfg(target_os = "android")]
+             self.touch_regions.clear();
++            self.touch_move_zone = None;
+             return std::mem::take(&mut self.events);
+         }
+ 
+diff --git a/voxygen/src/hud/touch_buttons.rs b/voxygen/src/hud/touch_buttons.rs
+index 95a10aa9..587957ff 100644
+--- a/voxygen/src/hud/touch_buttons.rs
++++ b/voxygen/src/hud/touch_buttons.rs
+@@ -28,7 +28,10 @@
+ //! The tests at the bottom assert the invariants for every device shape we care
+ //! about: nothing overlaps and nothing leaves the screen.
+ 
+-use crate::game_input::GameInput;
++use crate::{
++    game_input::GameInput,
++    launcher_config::{Anchor, LauncherConfig, Movement, Placed},
++};
+ use vek::Vec2;
+ 
+ /// What a button does when tapped.
+@@ -474,8 +477,47 @@ const SLOT_PAGE_TOGGLE: usize = SLOT_EXTRA_TOGGLE + 1;
+ const SLOT_STATE: usize = SLOT_PAGE_TOGGLE + 1;
+ const SLOT_EXTRA_FIRST: usize = SLOT_STATE + 1;
+ 
++/// The four arrows that replace the stick in D-pad mode.
++const SLOT_DPAD_FIRST: usize = SLOT_EXTRA_FIRST + EXTRA_ACTIONS.len();
++
+ /// Total number of button slots; used to size the widget ids.
+-pub const COUNT: usize = SLOT_EXTRA_FIRST + EXTRA_ACTIONS.len();
++pub const COUNT: usize = SLOT_DPAD_FIRST + DPAD.len();
++
++/// Arrows of the D-pad: name and direction from its centre (x right, y down).
++const DPAD: [(&str, f32, f32, &str); 4] = [
++    ("dpad_up", 0.0, -1.0, "^"),
++    ("dpad_down", 0.0, 1.0, "v"),
++    ("dpad_left", -1.0, 0.0, "<"),
++    ("dpad_right", 1.0, 0.0, ">"),
++];
++/// Size of one arrow and its distance from the centre, relative to the stick.
++const DPAD_ARROW: f32 = 0.32;
++const DPAD_OFFSET: f32 = 0.34;
++
++/// Every image name a button can ask a resource pack for.
++pub const ICONS: &[&str] = &[
++    "joystick", "dpad_up", "dpad_down", "dpad_left", "dpad_right", "inventory", "diary", "menu",
++    "slot1", "slot2", "slot3", "slot4", "slot5", "slot6", "slot7", "slot8", "slot9", "slot10",
++    "slotpage", "more", "less", "extra", "interact", "jump", "alt", "roll", "attack", "mount",
++    "unmount", "trade", "stay", "follow", "chat", "map", "swap", "draw", "sheathe", "block",
++    "lantern", "glide", "sneak", "sit", "crawl", "dance", "greet", "zoomin", "zoomout",
++    "zoomlock", "type", "crafting", "social", "autowalk", "walk", "camera", "select", "accept",
++    "decline", "down", "giveup", "respawn",
++];
++
++/// Short name of a message id, e.g. `hud-touch-jump` is `jump`.
++fn short(key: &'static str) -> &'static str {
++    key.strip_prefix("hud-touch-")
++        .or_else(|| key.strip_prefix("hud-"))
++        .unwrap_or(key)
++}
++
++fn slot_name(symbol: &str) -> Option<&'static str> {
++    ICONS
++        .iter()
++        .copied()
++        .find(|name| name.strip_prefix("slot") == Some(symbol))
++}
+ 
+ /// What the player has opened or switched on the overlay itself.
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+@@ -523,7 +565,161 @@ pub fn shown_in(
+     aspect: f32,
+     localize: impl Fn(&str) -> String,
+ ) -> Vec<Shown> {
+-    let mut buttons = shown(ctx, view.more, aspect, &localize);
++    shown_pinned(ctx, view, aspect, &|_| false, localize)
++}
++
++/// Like [`shown_in`], with the player's own choices from the launcher applied:
++/// buttons are moved, resized or hidden, context actions that were given a
++/// place stay on screen whenever they are available, and the stick can be
++/// swapped for a D-pad.
++pub fn shown_for(
++    ctx: &Context,
++    view: View,
++    aspect: f32,
++    config: &LauncherConfig,
++    localize: impl Fn(&str) -> String,
++) -> Vec<Shown> {
++    let pinned = |id: &str| config.buttons.contains_key(id);
++    let mut buttons = shown_pinned(ctx, view, aspect, &pinned, localize);
++    buttons.retain_mut(|button| match config.buttons.get(button.id) {
++        Some(placed) => {
++            button.center = anchored(placed, aspect);
++            button.diameter *= placed.scale;
++            placed.visible || always_visible(button.id)
++        },
++        None => true,
++    });
++    if view.more || view.extra {
++        // Placed buttons that an open grid would cover step aside until it is
++        // closed again.
++        let grid: Vec<(Vec2<f32>, f32)> = buttons
++            .iter()
++            .filter(|button| {
++                (is_context_slot(button.index) || is_extra_slot(button.index))
++                    && !config.buttons.contains_key(button.id)
++            })
++            .map(|button| (button.center, button.diameter))
++            .collect();
++        buttons.retain(|button| {
++            !config.buttons.contains_key(button.id)
++                || matches!(button.id, "move" | "menu" | "more" | "extra")
++                || !grid.iter().any(|&(center, diameter)| {
++                    let reach = (diameter + button.diameter) / 2.0;
++                    (center.x - button.center.x).abs() * aspect < reach
++                        && (center.y - button.center.y).abs() < reach
++                })
++        });
++    }
++    if config.movement == Movement::Dpad
++        && let Some(stick) = buttons.iter().position(|button| button.id == "move")
++    {
++        let stick = buttons.remove(stick);
++        for (offset, (name, x, y, label)) in DPAD.into_iter().enumerate() {
++            let distance = stick.diameter * DPAD_OFFSET;
++            buttons.push(Shown {
++                index: SLOT_DPAD_FIRST + offset,
++                id: name,
++                icon: name,
++                action: None,
++                center: stick.center
++                    + Vec2::new(x * distance / aspect.max(0.1), y * distance),
++                diameter: stick.diameter * DPAD_ARROW,
++                label: label.to_owned(),
++                active: false,
++            });
++        }
++    }
++    buttons
++}
++
++fn is_context_slot(index: usize) -> bool {
++    (1 + FIXED.len()..1 + FIXED.len() + CONTEXT_SLOTS).contains(&index)
++}
++
++fn is_extra_slot(index: usize) -> bool { (SLOT_EXTRA_FIRST..SLOT_DPAD_FIRST).contains(&index) }
++
++/// Buttons that cannot be hidden, so that the player never gets stuck.
++fn always_visible(id: &str) -> bool { matches!(id, "move" | "menu" | "respawn") }
++
++/// Screen position of a button the player placed.
++fn anchored(placed: &Placed, aspect: f32) -> Vec2<f32> {
++    let aspect = aspect.max(0.1);
++    let x = match placed.anchor {
++        Anchor::Left => placed.offset / aspect,
++        Anchor::Center => 0.5 + placed.offset / aspect,
++        Anchor::Right => 1.0 - placed.offset / aspect,
++    };
++    // Keep the centre on screen whatever the shape of this device.
++    Vec2::new(x.clamp(0.0, 1.0), placed.row)
++}
++
++/// The part of the screen that steers the character.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct MoveZone {
++    /// Centre as fractions of the screen.
++    pub center: Vec2<f32>,
++    /// Half-side length as a fraction of the screen height.
++    pub half_extent: f32,
++    pub mode: Movement,
++    /// Set when the player moved the control or uses the D-pad. Otherwise the
++    /// whole lower left of the screen steers.
++    pub custom: bool,
++}
++
++impl MoveZone {
++    /// Whether a touch starting at `position` steers.
++    pub fn claims(&self, position: Vec2<f32>, width: f32, height: f32) -> bool {
++        if !self.custom {
++            return position.x < width * 0.42 && position.y > height * 0.32;
++        }
++        let delta = position - Vec2::new(self.center.x * width, self.center.y * height);
++        let half = self.half_extent * height;
++        delta.x.abs() <= half && delta.y.abs() <= half
++    }
++}
++
++/// Where movement touches go, or `None` when the character cannot move.
++pub fn move_zone(ctx: &Context, aspect: f32, config: &LauncherConfig) -> Option<MoveZone> {
++    if ctx.dead {
++        return None;
++    }
++    let placed = config.buttons.get("move");
++    let center = placed.map_or(Vec2::new(STICK_X, STICK_Y), |p| anchored(p, aspect));
++    let diameter = D_STICK * placed.map_or(1.0, |p| p.scale);
++    let half_extent = match config.movement {
++        // A little margin around the arrows.
++        Movement::Dpad => diameter * 0.55,
++        // A floating stick may be grabbed somewhat outside its picture.
++        Movement::Joystick => diameter * 0.8,
++    };
++    Some(MoveZone {
++        center,
++        half_extent,
++        mode: config.movement,
++        custom: placed.is_some() || config.movement == Movement::Dpad,
++    })
++}
++
++/// Movement for a finger at `offset` from the middle of the D-pad (screen
++/// coordinates), in game axes (x right, y forward). Snaps to eight directions.
++pub fn dpad_axis(offset: Vec2<f32>, radius: f32) -> Vec2<f32> {
++    if offset.magnitude() < radius * 0.15 {
++        return Vec2::zero();
++    }
++    let step = std::f32::consts::FRAC_PI_4;
++    let angle = ((-offset.y).atan2(offset.x) / step).round() * step;
++    let snap = |value: f32| if value.abs() < 0.1 { 0.0 } else { value };
++    Vec2::new(snap(angle.cos()), snap(angle.sin()))
++}
++
++fn shown_pinned(
++    ctx: &Context,
++    view: View,
++    aspect: f32,
++    pinned: &dyn Fn(&str) -> bool,
++    localize: impl Fn(&str) -> String,
++) -> Vec<Shown> {
++    let mut buttons = shown_core(ctx, view.more, aspect, pinned, &localize);
+     if view.second_slots {
+         for button in &mut buttons {
+             if let Some(Kind::Input(input)) = button.action
+@@ -531,6 +727,7 @@ pub fn shown_in(
+             {
+                 button.action = Some(Kind::Input(input));
+                 button.label = symbol.to_owned();
++                button.icon = slot_name(symbol).unwrap_or(button.icon);
+             }
+         }
+     }
+@@ -539,6 +736,8 @@ pub fn shown_in(
+     }
+     buttons.push(Shown {
+         index: SLOT_EXTRA_TOGGLE,
++        id: "extra",
++        icon: if view.extra { "less" } else { "extra" },
+         action: Some(Kind::Extra),
+         center: center_of(Side::Left, LANE_TOGGLE, ROW_MENU, aspect),
+         diameter: D_MENU,
+@@ -551,6 +750,8 @@ pub fn shown_in(
+     });
+     buttons.push(Shown {
+         index: SLOT_PAGE_TOGGLE,
++        id: "slotpage",
++        icon: "slotpage",
+         action: Some(Kind::SlotPage),
+         center: center_of(Side::Left, LANE_TOGGLE, ROW_SLOT, aspect),
+         diameter: D_SLOT,
+@@ -574,6 +775,8 @@ pub fn shown_in(
+         };
+         buttons.push(Shown {
+             index: SLOT_STATE,
++            id: "state",
++            icon: short(key),
+             action: Some(Kind::Input(input)),
+             center: center_of(Side::Right, lane, ROW_HIGH, aspect),
+             diameter: D_SMALL,
+@@ -581,8 +784,12 @@ pub fn shown_in(
+             active: false,
+         });
+     }
+-    if view.extra {
++    {
+         for (slot, (input, key)) in EXTRA_ACTIONS.into_iter().enumerate() {
++            // A pinned action stays on screen with the grid closed too.
++            if !view.extra && !pinned(short(key)) {
++                continue;
++            }
+             let invite_answer = matches!(
+                 input,
+                 GameInput::AcceptGroupInvite | GameInput::DeclineGroupInvite
+@@ -595,6 +802,8 @@ pub fn shown_in(
+             };
+             buttons.push(Shown {
+                 index: SLOT_EXTRA_FIRST + slot,
++                id: short(key),
++                icon: short(key),
+                 action: Some(Kind::Input(input)),
+                 center: center_of(Side::Right, placement.lane, placement.row, aspect),
+                 diameter: placement.diameter,
+@@ -610,6 +819,10 @@ pub fn shown_in(
+ pub struct Shown {
+     /// Stable slot index, used to pick the widget ids.
+     pub index: usize,
++    /// Name the launcher uses to place this button.
++    pub id: &'static str,
++    /// Name of the image a resource pack may provide for it.
++    pub icon: &'static str,
+     /// `None` for purely visual buttons (the movement stick).
+     pub action: Option<Kind>,
+     /// Centre as fractions of the screen (x of width, y of height from top).
+@@ -767,11 +980,25 @@ pub fn shown(
+     expanded: bool,
+     aspect: f32,
+     localize: impl Fn(&str) -> String,
++) -> Vec<Shown> {
++    shown_core(ctx, expanded, aspect, &|_| false, localize)
++}
++
++/// [`shown`], also offering the context actions the player pinned. Their
++/// position is a placeholder that [`shown_for`] replaces.
++fn shown_core(
++    ctx: &Context,
++    expanded: bool,
++    aspect: f32,
++    pinned: &dyn Fn(&str) -> bool,
++    localize: impl Fn(&str) -> String,
+ ) -> Vec<Shown> {
+     let mut shown = Vec::with_capacity(COUNT);
+     if !ctx.dead {
+         shown.push(Shown {
+             index: 0,
++            id: "move",
++            icon: "joystick",
+             action: None,
+             center: Vec2::new(STICK_X, STICK_Y),
+             diameter: D_STICK,
+@@ -808,8 +1035,20 @@ pub fn shown(
+         } else {
+             button.lane
+         };
++        let (id, icon) = match button.label {
++            Label::Key(key) => (short(key), short(key)),
++            Label::Symbol(symbol) => {
++                let name = slot_name(symbol).unwrap_or("slot1");
++                (name, name)
++            },
++            Label::Toggle { closed, open } => {
++                (short(closed), short(if expanded { open } else { closed }))
++            },
++        };
+         shown.push(Shown {
+             index: offset + 1,
++            id,
++            icon,
+             action: button.action,
+             center: center_of(button.side, lane, button.row, aspect),
+             diameter: button.diameter,
+@@ -829,6 +1068,21 @@ pub fn shown(
+         if !spec.enabled {
+             continue;
+         }
++        let id = short(ACTIONS[spec.slot].1);
++        if pinned(id) {
++            // It has its own place and does not take up a context slot.
++            shown.push(Shown {
++                index: 1 + FIXED.len() + spec.slot,
++                id,
++                icon: short(spec.label_key),
++                action: Some(spec.kind),
++                center: Vec2::new(0.5, 0.5),
++                diameter: D_SMALL,
++                label: localize(spec.label_key),
++                active: spec.active,
++            });
++            continue;
++        }
+         // These controls live in the expanded grid even when fewer than three
+         // nearby actions are available. In particular, the map must not occupy
+         // the bottom context slot where it could overlap the respawn button.
+@@ -863,6 +1117,8 @@ pub fn shown(
+         };
+         shown.push(Shown {
+             index: 1 + FIXED.len() + spec.slot,
++            id,
++            icon: short(spec.label_key),
+             action: Some(spec.kind),
+             center: center_of(Side::Right, placement.lane, placement.row, aspect),
+             diameter: placement.diameter,
+@@ -875,6 +1131,8 @@ pub fn shown(
+         // key to press for it, so it gets a button of its own.
+         shown.push(Shown {
+             index: 1 + FIXED.len() + CONTEXT_SLOTS,
++            id: "respawn",
++            icon: "respawn",
+             action: Some(Kind::Input(GameInput::Respawn)),
+             center: Vec2::new(X_RESPAWN, ROW_RESPAWN),
+             diameter: D_ATTACK,
+@@ -1505,4 +1763,204 @@ mod tests {
+         assert!(has_input(&buttons, GameInput::GiveUp));
+         assert!(!has_input(&buttons, GameInput::SwimDown));
+     }
++
++    fn custom(text: &str) -> LauncherConfig { LauncherConfig::parse(text) }
++
++    fn by_id<'a>(buttons: &'a [Shown], id: &str) -> Option<&'a Shown> {
++        buttons.iter().find(|button| button.id == id)
++    }
++
++    #[test]
++    fn without_launcher_choices_nothing_changes() {
++        for aspect in ASPECTS {
++            let view = View::default();
++            let plain = shown_in(&full_context(), view, aspect, str::to_owned);
++            let custom = shown_for(
++                &full_context(),
++                view,
++                aspect,
++                &LauncherConfig::default(),
++                str::to_owned,
++            );
++            assert_eq!(plain.len(), custom.len());
++            for (a, b) in plain.iter().zip(&custom) {
++                assert_eq!((a.index, a.center, a.diameter), (b.index, b.center, b.diameter));
++            }
++            let zone = move_zone(&full_context(), aspect, &LauncherConfig::default()).unwrap();
++            assert!(zone.claims(Vec2::new(10.0, 900.0), 1920.0, 1080.0));
++            assert!(!zone.claims(Vec2::new(1500.0, 900.0), 1920.0, 1080.0));
++        }
++    }
++
++    #[test]
++    fn placed_buttons_move_resize_and_hide() {
++        let config = custom(
++            "button.jump=R,0.5,0.5,2,1\nbutton.attack=R,0.2,0.2,1,0\n\
++             button.menu=C,0,0.1,1,0\nbutton.slot1=C,-0.2,0.9,1,1\n",
++        );
++        let view = View {
++            second_slots: true,
++            ..View::default()
++        };
++        let buttons = shown_for(&full_context(), view, 2.0, &config, str::to_owned);
++        let jump = by_id(&buttons, "jump").unwrap();
++        assert_eq!(jump.center, Vec2::new(0.75, 0.5));
++        assert_eq!(jump.diameter, D_SMALL * 2.0);
++        assert!(by_id(&buttons, "attack").is_none());
++        // The menu button cannot be hidden.
++        assert!(by_id(&buttons, "menu").is_some());
++        // Slots 6-10 appear where 1-5 were put, with their own picture.
++        let slot = by_id(&buttons, "slot1").unwrap();
++        assert_eq!(slot.center, Vec2::new(0.4, 0.9));
++        assert_eq!(slot.icon, "slot6");
++        assert_eq!(slot.action, Some(Kind::Input(GameInput::Slot6)));
++    }
++
++    #[test]
++    fn pinned_actions_stay_on_screen() {
++        let config = custom("button.map=R,0.5,0.2,1,1\nbutton.type=L,0.5,0.4,1,1\n");
++        let closed = shown_for(&full_context(), View::default(), 2.0, &config, str::to_owned);
++        assert!(has_input(&closed, GameInput::Map));
++        assert!(has_input(&closed, GameInput::Chat));
++        assert!(!has_input(&closed, GameInput::Crafting));
++        // Opening a grid does not duplicate them.
++        for view in [
++            View {
++                more: true,
++                ..View::default()
++            },
++            View {
++                extra: true,
++                ..View::default()
++            },
++        ] {
++            let open = shown_for(&full_context(), view, 2.0, &config, str::to_owned);
++            for id in ["map", "type"] {
++                assert_eq!(open.iter().filter(|b| b.id == id).count(), 1, "{id}");
++            }
++        }
++    }
++
++    #[test]
++    fn the_dpad_replaces_the_stick() {
++        let config = custom("movement=dpad\n");
++        let buttons = shown_for(&full_context(), View::default(), 2.0, &config, str::to_owned);
++        assert!(by_id(&buttons, "move").is_none());
++        for (name, ..) in DPAD {
++            let arrow = by_id(&buttons, name).unwrap();
++            assert_eq!(arrow.action, None);
++            let zone = move_zone(&full_context(), 2.0, &config).unwrap();
++            let position = Vec2::new(arrow.center.x * 2000.0, arrow.center.y * 1000.0);
++            assert!(zone.claims(position, 2000.0, 1000.0), "{name}");
++        }
++        assert!(move_zone(&dead_context(), 2.0, &config).is_none());
++    }
++
++    #[test]
++    fn dpad_directions_snap_to_eight_ways() {
++        let axis = |x, y| dpad_axis(Vec2::new(x, y), 100.0);
++        assert_eq!(axis(0.0, 0.0), Vec2::zero());
++        assert_eq!(axis(0.0, -80.0), Vec2::new(0.0, 1.0));
++        assert_eq!(axis(5.0, 80.0), Vec2::new(0.0, -1.0));
++        assert_eq!(axis(-80.0, 3.0), Vec2::new(-1.0, 0.0));
++        let diagonal = axis(60.0, -60.0);
++        assert!(diagonal.x > 0.7 && diagonal.y > 0.7 && diagonal.magnitude() < 1.001);
++    }
++
++    #[test]
++    fn every_picture_name_is_loaded_and_ids_are_unique() {
++        let contexts = [
++            full_context(),
++            dead_context(),
++            Context {
++                downed: true,
++                riding: false,
++                has_invite: true,
++                ..full_context()
++            },
++            Context {
++                riding: true,
++                pet_staying: true,
++                wielding: false,
++                ..full_context()
++            },
++        ];
++        for ctx in contexts {
++            for config in [LauncherConfig::default(), custom("movement=dpad\n")] {
++                for view in [(false, false, false), (true, false, true), (false, true, true)] {
++                    let view = View {
++                        more: view.0,
++                        extra: view.1,
++                        second_slots: view.2,
++                    };
++                    let buttons = shown_for(&ctx, view, 2.0, &config, str::to_owned);
++                    let mut ids = std::collections::HashSet::new();
++                    for button in &buttons {
++                        assert!(ICONS.contains(&button.icon), "{}", button.icon);
++                        assert!(ids.insert(button.id), "duplicate id {}", button.id);
++                        assert!(button.index < COUNT);
++                    }
++                }
++            }
++        }
++    }
++
++    /// Reads a file written by the launcher, when one is given.
++    #[test]
++    fn launcher_preset_does_not_overlap() {
++        let Ok(path) = std::env::var("LAUNCHER_PRESET") else {
++            return;
++        };
++        let config = custom(&std::fs::read_to_string(path).unwrap());
++        assert!(config.buttons.len() > 10);
++        let contexts = [
++            full_context(),
++            Context {
++                downed: true,
++                ..full_context()
++            },
++            Context {
++                swimming: true,
++                has_invite: true,
++                ..full_context()
++            },
++        ];
++        let mut problems = Vec::new();
++        for aspect in [16.0 / 9.0, 2.0, 19.5 / 9.0, 20.0 / 9.0, 21.0 / 9.0] {
++            for (ctx, more, extra) in contexts
++                .into_iter()
++                .flat_map(|ctx| [(ctx, false, false), (ctx, true, false), (ctx, false, true)])
++            {
++                let view = View {
++                    more,
++                    extra,
++                    ..View::default()
++                };
++                let buttons = shown_for(&ctx, view, aspect, &config, str::to_owned);
++                for (i, a) in buttons.iter().enumerate() {
++                    let half = a.diameter / 2.0;
++                    let x = a.center.x * aspect;
++                    if x - half < 0.0
++                        || x + half > aspect
++                        || a.center.y - half < 0.0
++                        || a.center.y + half > 1.0
++                    {
++                        problems.push(format!("{aspect:.2}: {} leaves the screen", a.id));
++                    }
++                    for b in &buttons[i + 1..] {
++                        let dx = (a.center.x - b.center.x).abs() * aspect;
++                        let dy = (a.center.y - b.center.y).abs();
++                        let need = (a.diameter + b.diameter) / 2.0;
++                        if dx < need - 0.001 && dy < need - 0.001 {
++                            problems
++                                .push(format!("{aspect:.2} {more}/{extra}: {} over {}", a.id, b.id));
++                        }
++                    }
++                }
++            }
++        }
++        problems.sort();
++        problems.dedup();
++        assert!(problems.is_empty(), "{problems:#?}");
++    }
+ }
+diff --git a/voxygen/src/launcher_config.rs b/voxygen/src/launcher_config.rs
+new file mode 100644
+index 00000000..241a25b8
+--- /dev/null
++++ b/voxygen/src/launcher_config.rs
+@@ -0,0 +1,228 @@
++//! Choices made in the Android launcher, read once when the game starts.
++//!
++//! The launcher writes `<app files>/launcher/config.txt` as `key=value` lines:
++//!
++//! ```text
++//! movement=joystick            (or dpad)
++//! opacity=1.0
++//! button.jump=R,0.14,0.78,1.0,1   (anchor, offset, row, scale, visible)
++//! perf.revision=3
++//! perf.render_scale=0.5
++//! ```
++//!
++//! Offsets and rows are fractions of the screen height; the anchor says whether
++//! the offset counts from the left edge, the centre or the right edge. Lines
++//! that are missing or invalid leave the game's own behaviour in place.
++
++use std::{collections::HashMap, path::Path, sync::OnceLock};
++
++/// Folder below the app's files directory that the launcher owns.
++pub const DIR: &str = "launcher";
++/// Merged contents of the enabled resource packs, used as asset override.
++pub const OVERRIDE_DIR: &str = "override";
++const CONFIG_FILE: &str = "config.txt";
++const APPLIED_FILE: &str = "graphics-applied.txt";
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Anchor {
++    Left,
++    Center,
++    Right,
++}
++
++/// Where the player put one button.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct Placed {
++    pub anchor: Anchor,
++    pub offset: f32,
++    pub row: f32,
++    pub scale: f32,
++    pub visible: bool,
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum Movement {
++    #[default]
++    Joystick,
++    Dpad,
++}
++
++/// Graphics choices. They are applied once per `revision`, so that changes made
++/// in the in-game settings afterwards are kept.
++#[derive(Clone, Copy, Debug, Default, PartialEq)]
++pub struct Graphics {
++    pub revision: u64,
++    pub render_scale: Option<f32>,
++    pub view_distance: Option<u32>,
++    pub max_fps: Option<u32>,
++    pub shadows: Option<bool>,
++}
++
++#[derive(Clone, Debug, PartialEq)]
++pub struct LauncherConfig {
++    pub movement: Movement,
++    /// Multiplies the transparency of the touch controls.
++    pub opacity: f32,
++    pub buttons: HashMap<String, Placed>,
++    pub graphics: Graphics,
++}
++
++impl Default for LauncherConfig {
++    fn default() -> Self {
++        Self {
++            movement: Movement::Joystick,
++            opacity: 1.0,
++            buttons: HashMap::new(),
++            graphics: Graphics::default(),
++        }
++    }
++}
++
++/// A finite number clamped into `min..=max`.
++fn number(text: &str, min: f32, max: f32) -> Option<f32> {
++    text.trim()
++        .parse::<f32>()
++        .ok()
++        .filter(|value| value.is_finite())
++        .map(|value| value.clamp(min, max))
++}
++
++fn placed(text: &str) -> Option<Placed> {
++    let mut parts = text.split(',').map(str::trim);
++    let anchor = match parts.next()? {
++        "L" => Anchor::Left,
++        "C" => Anchor::Center,
++        "R" => Anchor::Right,
++        _ => return None,
++    };
++    let offset = number(parts.next()?, -3.0, 3.0)?;
++    let row = number(parts.next()?, 0.0, 1.0)?;
++    let scale = number(parts.next()?, 0.5, 2.0)?;
++    let visible = parts.next()? != "0";
++    Some(Placed {
++        anchor,
++        offset,
++        row,
++        scale,
++        visible,
++    })
++}
++
++impl LauncherConfig {
++    pub fn parse(text: &str) -> Self {
++        let mut config = Self::default();
++        for line in text.lines() {
++            let Some((key, value)) = line.split_once('=') else {
++                continue;
++            };
++            let (key, value) = (key.trim(), value.trim());
++            if let Some(id) = key.strip_prefix("button.") {
++                if let Some(placed) = placed(value) {
++                    config.buttons.insert(id.to_owned(), placed);
++                }
++                continue;
++            }
++            let graphics = &mut config.graphics;
++            match key {
++                "movement" if value == "dpad" => config.movement = Movement::Dpad,
++                "opacity" => config.opacity = number(value, 0.2, 1.0).unwrap_or(1.0),
++                "perf.revision" => graphics.revision = value.parse().unwrap_or(0),
++                "perf.render_scale" => graphics.render_scale = number(value, 0.25, 1.0),
++                "perf.view_distance" => {
++                    graphics.view_distance = value.parse().ok().map(|v: u32| v.clamp(1, 32));
++                },
++                "perf.max_fps" => {
++                    graphics.max_fps = value.parse().ok().map(|v: u32| v.clamp(15, 120));
++                },
++                "perf.shadows" => graphics.shadows = Some(value != "0"),
++                _ => {},
++            }
++        }
++        config
++    }
++}
++
++static CURRENT: OnceLock<LauncherConfig> = OnceLock::new();
++
++/// Reads the launcher's file from `dir`. Only the first call has an effect.
++pub fn load(dir: &Path) {
++    let text = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap_or_default();
++    let _ = CURRENT.set(LauncherConfig::parse(&text));
++}
++
++/// The loaded choices, or the defaults when there is no launcher.
++pub fn current() -> &'static LauncherConfig { CURRENT.get_or_init(LauncherConfig::default) }
++
++/// Whether the graphics choices in `dir` still have to be applied.
++pub fn graphics_pending(dir: &Path, graphics: &Graphics) -> bool {
++    graphics.revision != 0
++        && std::fs::read_to_string(dir.join(APPLIED_FILE))
++            .ok()
++            .and_then(|text| text.trim().parse::<u64>().ok())
++            != Some(graphics.revision)
++}
++
++/// Remembers that this revision of the graphics choices has been applied.
++pub fn mark_graphics_applied(dir: &Path, graphics: &Graphics) -> std::io::Result<()> {
++    std::fs::write(dir.join(APPLIED_FILE), graphics.revision.to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_a_launcher_file() {
++        let config = LauncherConfig::parse(
++            "# comment\nmovement=dpad\nopacity=0.5\nbutton.jump=R,0.14,0.78,1.5,1\n\
++             button.diary=C,-0.24,0.09,1,0\nperf.revision=7\nperf.render_scale=0.65\n\
++             perf.view_distance=6\nperf.max_fps=45\nperf.shadows=0\n",
++        );
++        assert_eq!(config.movement, Movement::Dpad);
++        assert_eq!(config.opacity, 0.5);
++        assert_eq!(config.buttons["jump"], Placed {
++            anchor: Anchor::Right,
++            offset: 0.14,
++            row: 0.78,
++            scale: 1.5,
++            visible: true,
++        });
++        assert!(!config.buttons["diary"].visible);
++        assert_eq!(config.graphics, Graphics {
++            revision: 7,
++            render_scale: Some(0.65),
++            view_distance: Some(6),
++            max_fps: Some(45),
++            shadows: Some(false),
++        });
++    }
++
++    #[test]
++    fn invalid_lines_are_ignored_or_clamped() {
++        let config = LauncherConfig::parse(
++            "button.a=Q,1,1,1,1\nbutton.b=L,NaN,0.5,1,1\nbutton.c=L,0.1\n\
++             button.d=L,99,7,99,1\nopacity=abc\nperf.max_fps=100000\nnonsense\n",
++        );
++        assert_eq!(config.buttons.len(), 1);
++        let d = config.buttons["d"];
++        assert_eq!((d.offset, d.row, d.scale), (3.0, 1.0, 2.0));
++        assert_eq!(config.opacity, 1.0);
++        assert_eq!(config.graphics.max_fps, Some(120));
++        assert_eq!(LauncherConfig::parse(""), LauncherConfig::default());
++    }
++
++    #[test]
++    fn graphics_apply_once_per_revision() {
++        let dir = std::env::temp_dir().join(format!("launcher-config-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let mut graphics = Graphics::default();
++        assert!(!graphics_pending(&dir, &graphics));
++        graphics.revision = 2;
++        assert!(graphics_pending(&dir, &graphics));
++        mark_graphics_applied(&dir, &graphics).unwrap();
++        assert!(!graphics_pending(&dir, &graphics));
++        graphics.revision = 3;
++        assert!(graphics_pending(&dir, &graphics));
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++}
+diff --git a/voxygen/src/lib.rs b/voxygen/src/lib.rs
+index dbb88845..1ad4de91 100644
+--- a/voxygen/src/lib.rs
++++ b/voxygen/src/lib.rs
+@@ -23,6 +23,9 @@ pub mod error;
+ pub mod game_input;
+ pub mod hud;
+ pub mod key_state;
++// Parsed everywhere so that it can be tested; only read on phones.
++#[cfg_attr(not(target_os = "android"), allow(dead_code))]
++pub(crate) mod launcher_config;
+ pub mod menu;
+ pub mod mesh;
+ pub mod panic_handler;
+@@ -56,6 +59,19 @@ pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
+     crate::android_log::install_panic_hook();
+     crate::android_log::stage("android_main entered");
+     crate::android_log::stage("SSL_CERT_DIR pointed at system CA store");
++    if let Some(files) = app.internal_data_path() {
++        let launcher = files.join(launcher_config::DIR);
++        let packs = launcher.join(launcher_config::OVERRIDE_DIR);
++        if packs.is_dir() {
++            // Files of the enabled resource packs take precedence over the
++            // game's own. SAFETY: as above, no other Rust threads exist yet.
++            unsafe {
++                std::env::set_var("VELOREN_ASSETS_OVERRIDE", &packs);
++            }
++            crate::android_log::stage("resource packs enabled");
++        }
++        launcher_config::load(&launcher);
++    }
+     crate::app::run(&app);
+ }
+ 
+diff --git a/voxygen/src/session/mod.rs b/voxygen/src/session/mod.rs
+index b14dada2..09a32405 100644
+--- a/voxygen/src/session/mod.rs
++++ b/voxygen/src/session/mod.rs
+@@ -99,6 +99,11 @@ enum AndroidTouchControl {
+     Move {
+         origin: Vec2<f32>,
+     },
++    /// Steering by the direction from the middle of the D-pad, in pixels.
++    Dpad {
++        center: Vec2<f32>,
++        radius: f32,
++    },
+     Look {
+         last: Vec2<f32>,
+     },
+@@ -252,7 +257,7 @@ impl SessionState {
+     fn release_android_touches(&mut self, global_state: &mut GlobalState) {
+         for (_, control) in self.android_touches.drain() {
+             match control {
+-                AndroidTouchControl::Move { .. } => {
++                AndroidTouchControl::Move { .. } | AndroidTouchControl::Dpad { .. } => {
+                     global_state
+                         .window
+                         .send_event(Event::AnalogGameInput(AnalogGameInput::MovementX(0.0)));
+@@ -297,7 +302,7 @@ impl SessionState {
+ 
+         match phase {
+             TouchPhase::Started => {
+-                use crate::hud::touch_buttons::Kind;
++                use crate::{hud::touch_buttons::Kind, launcher_config::Movement};
+                 let control = if let Some(action) =
+                     android_touch_button(self.hud.touch_regions(), position, width, height)
+                 {
+@@ -323,14 +328,33 @@ impl SessionState {
+                             AndroidTouchControl::Overlay
+                         },
+                     }
+-                } else if position.x < width * 0.42 && position.y > height * 0.32 {
++                } else if let Some(zone) = self
++                    .hud
++                    .touch_move_zone()
++                    .filter(|zone| zone.claims(position, width, height))
++                {
++                    let (control, axis) = match zone.mode {
++                        Movement::Joystick => (
++                            AndroidTouchControl::Move { origin: position },
++                            Vec2::zero(),
++                        ),
++                        Movement::Dpad => {
++                            let center =
++                                Vec2::new(zone.center.x * width, zone.center.y * height);
++                            let radius = (zone.half_extent * height).max(1.0);
++                            (
++                                AndroidTouchControl::Dpad { center, radius },
++                                crate::hud::touch_buttons::dpad_axis(position - center, radius),
++                            )
++                        },
++                    };
+                     global_state
+                         .window
+-                        .send_event(Event::AnalogGameInput(AnalogGameInput::MovementX(0.0)));
++                        .send_event(Event::AnalogGameInput(AnalogGameInput::MovementX(axis.x)));
+                     global_state
+                         .window
+-                        .send_event(Event::AnalogGameInput(AnalogGameInput::MovementY(0.0)));
+-                    AndroidTouchControl::Move { origin: position }
++                        .send_event(Event::AnalogGameInput(AnalogGameInput::MovementY(axis.y)));
++                    control
+                 } else {
+                     AndroidTouchControl::Look { last: position }
+                 };
+@@ -354,6 +378,18 @@ impl SessionState {
+                                 AnalogGameInput::MovementY(-axis.y),
+                             ));
+                         },
++                        AndroidTouchControl::Dpad { center, radius } => {
++                            let axis = crate::hud::touch_buttons::dpad_axis(
++                                position - *center,
++                                *radius,
++                            );
++                            global_state.window.send_event(Event::AnalogGameInput(
++                                AnalogGameInput::MovementX(axis.x),
++                            ));
++                            global_state.window.send_event(Event::AnalogGameInput(
++                                AnalogGameInput::MovementY(axis.y),
++                            ));
++                        },
+                         AndroidTouchControl::Look { last } => {
+                             let delta = position - *last;
+                             *last = position;
+@@ -376,7 +412,7 @@ impl SessionState {
+             TouchPhase::Ended | TouchPhase::Cancelled => {
+                 if let Some(control) = self.android_touches.remove(&id) {
+                     match control {
+-                        AndroidTouchControl::Move { .. } => {
++                        AndroidTouchControl::Move { .. } | AndroidTouchControl::Dpad { .. } => {
+                             global_state.window.send_event(Event::AnalogGameInput(
+                                 AnalogGameInput::MovementX(0.0),
+                             ));

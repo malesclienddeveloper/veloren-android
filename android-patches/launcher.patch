@@ -67,15 +67,372 @@ index afdfa78a..8d6a3666 100644
          </activity>
      </application>
  </manifest>
+diff --git a/android/app/src/main/java/net/veloren/android/ControlEditor.java b/android/app/src/main/java/net/veloren/android/ControlEditor.java
+new file mode 100644
+index 00000000..f2ea3742
+--- /dev/null
++++ b/android/app/src/main/java/net/veloren/android/ControlEditor.java
+@@ -0,0 +1,282 @@
++package net.veloren.android;
++
++import android.annotation.SuppressLint;
++import android.app.AlertDialog;
++import android.content.Context;
++import android.graphics.Canvas;
++import android.graphics.Color;
++import android.graphics.Paint;
++import android.graphics.RectF;
++import android.view.Gravity;
++import android.view.MotionEvent;
++import android.view.View;
++import android.widget.Button;
++import android.widget.FrameLayout;
++import android.widget.LinearLayout;
++import android.widget.TextView;
++
++import java.util.List;
++import java.util.Map;
++
++/** Full-screen editor: drag the touch buttons to where they should be in the game. */
++@SuppressLint("ViewConstructor")
++final class ControlEditor extends FrameLayout {
++    private final LauncherConfig config;
++    private final Runnable changed;
++    private final Surface surface;
++    private final LinearLayout panel;
++    private final TextView selectedName;
++    private final Button hide;
++    private String selected;
++
++    ControlEditor(Context context, LauncherConfig config, Runnable changed, Runnable close) {
++        super(context);
++        this.config = config;
++        this.changed = changed;
++        setBackgroundColor(Widgets.BACKGROUND);
++
++        surface = new Surface(context);
++        addView(surface);
++
++        // The middle of the screen is empty in every layout, so the tools sit there.
++        panel = Widgets.card(context);
++        panel.setGravity(Gravity.CENTER_HORIZONTAL);
++        selectedName = Widgets.text(context, "", 14, Widgets.TEXT);
++        selectedName.setGravity(Gravity.CENTER);
++        Widgets.add(panel, selectedName);
++        LinearLayout first = Widgets.row(context);
++        Widgets.add(first, Widgets.button(context, "Kecil −", () -> resize(-0.1f)));
++        Widgets.add(first, Widgets.button(context, "Besar +", () -> resize(0.1f)));
++        hide = Widgets.button(context, "Sembunyikan", this::hideOrRemove);
++        Widgets.add(first, hide);
++        Widgets.add(panel, first);
++        LinearLayout second = Widgets.row(context);
++        Widgets.add(second, Widgets.button(context, "Tambah tombol", this::addButton));
++        Widgets.add(second, Widgets.button(context, "Reset", this::reset));
++        Button done = Widgets.button(context, "Selesai", close);
++        Widgets.highlight(done, true);
++        Widgets.add(second, done);
++        Widgets.add(panel, second);
++        addView(panel, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT,
++                Gravity.CENTER));
++        select(null);
++    }
++
++    private void select(String id) {
++        selected = id;
++        LauncherConfig.Spot spot = id == null ? null : config.spots.get(id);
++        if (spot == null) {
++            selected = null;
++            selectedName.setText("Geser tombol untuk memindahkan");
++            hide.setText("Sembunyikan");
++        } else {
++            LauncherConfig.Button button = LauncherConfig.BUTTONS.get(id);
++            selectedName.setText(button.label + "  ·  " + Math.round(spot.scale * 100) + "%");
++            hide.setText(button.optional ? "Lepas dari layar"
++                    : spot.visible ? "Sembunyikan" : "Tampilkan");
++        }
++        surface.invalidate();
++    }
++
++    private void edited() {
++        config.layout = LauncherConfig.LAYOUT_CUSTOM;
++        changed.run();
++        surface.invalidate();
++    }
++
++    private void resize(float step) {
++        LauncherConfig.Spot spot = selected == null ? null : config.spots.get(selected);
++        if (spot != null) {
++            spot.scale = LauncherConfig.clamp(spot.scale + step, 0.5f, 2);
++            edited();
++            select(selected);
++        }
++    }
++
++    private void hideOrRemove() {
++        LauncherConfig.Spot spot = selected == null ? null : config.spots.get(selected);
++        if (spot == null) {
++            return;
++        }
++        if (LauncherConfig.BUTTONS.get(selected).optional) {
++            // Back to its place in the game's "More" or "Extra" grid.
++            config.spots.remove(selected);
++            edited();
++            select(null);
++        } else if (LauncherConfig.canHide(selected)) {
++            spot.visible = !spot.visible;
++            edited();
++            select(selected);
++        } else {
++            selectedName.setText("Tombol ini tidak bisa disembunyikan");
++        }
++    }
++
++    private void addButton() {
++        List<LauncherConfig.Button> missing = config.unplaced();
++        if (missing.isEmpty()) {
++            selectedName.setText("Semua tombol sudah ada di layar");
++            return;
++        }
++        String[] labels = new String[missing.size()];
++        for (int index = 0; index < labels.length; index++) {
++            labels[index] = missing.get(index).label;
++        }
++        new AlertDialog.Builder(getContext())
++                .setTitle("Tambah tombol ke layar")
++                .setItems(labels, (dialog, which) -> {
++                    String id = missing.get(which).id;
++                    config.spots.put(id, new LauncherConfig.Spot('C', 0, 0.2f, 1, true));
++                    edited();
++                    select(id);
++                })
++                .show();
++    }
++
++    private void reset() {
++        config.useMinecraftLayout();
++        changed.run();
++        select(null);
++    }
++
++    /** Draws the buttons as the game will, and handles dragging. */
++    private final class Surface extends View {
++        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
++        private final RectF square = new RectF();
++        private float grabX;
++        private float grabY;
++        private float downX;
++        private float downY;
++        private boolean dragging;
++
++        Surface(Context context) {
++            super(context);
++        }
++
++        private float diameter(String id, LauncherConfig.Spot spot) {
++            return LauncherConfig.BUTTONS.get(id).diameter * spot.scale * getHeight();
++        }
++
++        @Override
++        protected void onDraw(Canvas canvas) {
++            float width = getWidth();
++            float height = getHeight();
++            // Centre cross for orientation.
++            paint.setStyle(Paint.Style.STROKE);
++            paint.setStrokeWidth(Widgets.dp(getContext(), 1));
++            paint.setColor(Color.argb(40, 255, 255, 255));
++            canvas.drawLine(width / 2, 0, width / 2, height, paint);
++            canvas.drawLine(0, height / 2, width, height / 2, paint);
++
++            for (Map.Entry<String, LauncherConfig.Spot> entry : config.spots.entrySet()) {
++                String id = entry.getKey();
++                LauncherConfig.Spot spot = entry.getValue();
++                if (!LauncherConfig.BUTTONS.containsKey(id)) {
++                    continue;
++                }
++                float x = spot.x(width, height);
++                float y = spot.y(height);
++                float size = diameter(id, spot);
++                boolean chosen = id.equals(selected);
++                if (id.equals("move") && config.dpad) {
++                    float arrow = size * 0.32f;
++                    float offset = size * 0.34f;
++                    drawButton(canvas, x, y - offset, arrow, "▲", chosen, true);
++                    drawButton(canvas, x, y + offset, arrow, "▼", chosen, true);
++                    drawButton(canvas, x - offset, y, arrow, "◀", chosen, true);
++                    drawButton(canvas, x + offset, y, arrow, "▶", chosen, true);
++                } else {
++                    drawButton(canvas, x, y, size, LauncherConfig.BUTTONS.get(id).label,
++                            chosen, spot.visible);
++                }
++            }
++        }
++
++        private void drawButton(Canvas canvas, float x, float y, float size, String label,
++                boolean chosen, boolean visible) {
++            float half = size / 2;
++            square.set(x - half, y - half, x + half, y + half);
++            paint.setStyle(Paint.Style.FILL);
++            int alpha = Math.round((visible ? 200 : 50) * config.opacity);
++            paint.setColor(Color.argb(alpha, 55, 68, 92));
++            canvas.drawRect(square, paint);
++            paint.setStyle(Paint.Style.STROKE);
++            paint.setStrokeWidth(Widgets.dp(getContext(), chosen ? 3 : 1));
++            paint.setColor(chosen ? Color.rgb(120, 230, 140) : Color.argb(90, 255, 255, 255));
++            canvas.drawRect(square, paint);
++            paint.setStyle(Paint.Style.FILL);
++            paint.setColor(Color.argb(visible ? 235 : 100, 255, 255, 255));
++            paint.setTextAlign(Paint.Align.CENTER);
++            float text = Math.min(size * 0.24f, Widgets.dp(getContext(), 14));
++            paint.setTextSize(text);
++            float measured = paint.measureText(label);
++            if (measured > size * 0.92f) {
++                paint.setTextSize(text * size * 0.92f / measured);
++            }
++            canvas.drawText(label, x, y - (paint.ascent() + paint.descent()) / 2, paint);
++        }
++
++        /** The button drawn on top at this point. */
++        private String hit(float x, float y) {
++            String found = null;
++            for (Map.Entry<String, LauncherConfig.Spot> entry : config.spots.entrySet()) {
++                if (!LauncherConfig.BUTTONS.containsKey(entry.getKey())) {
++                    continue;
++                }
++                LauncherConfig.Spot spot = entry.getValue();
++                float half = diameter(entry.getKey(), spot) / 2;
++                if (Math.abs(x - spot.x(getWidth(), getHeight())) <= half
++                        && Math.abs(y - spot.y(getHeight())) <= half) {
++                    found = entry.getKey();
++                }
++            }
++            return found;
++        }
++
++        @Override
++        @SuppressLint("ClickableViewAccessibility")
++        public boolean onTouchEvent(MotionEvent event) {
++            switch (event.getActionMasked()) {
++                case MotionEvent.ACTION_DOWN: {
++                    String id = hit(event.getX(), event.getY());
++                    select(id);
++                    if (id != null) {
++                        LauncherConfig.Spot spot = config.spots.get(id);
++                        grabX = event.getX() - spot.x(getWidth(), getHeight());
++                        grabY = event.getY() - spot.y(getHeight());
++                        downX = event.getX();
++                        downY = event.getY();
++                        dragging = false;
++                    }
++                    return true;
++                }
++                case MotionEvent.ACTION_MOVE: {
++                    LauncherConfig.Spot spot =
++                            selected == null ? null : config.spots.get(selected);
++                    if (spot != null) {
++                        float slop = Widgets.dp(getContext(), 6);
++                        dragging |= Math.hypot(event.getX() - downX, event.getY() - downY) > slop;
++                        if (dragging) {
++                            // Out of the way while dragging.
++                            panel.setVisibility(INVISIBLE);
++                            spot.moveTo(event.getX() - grabX, event.getY() - grabY,
++                                    getWidth(), getHeight());
++                            invalidate();
++                        }
++                    }
++                    return true;
++                }
++                case MotionEvent.ACTION_UP:
++                case MotionEvent.ACTION_CANCEL:
++                    panel.setVisibility(VISIBLE);
++                    if (dragging) {
++                        dragging = false;
++                        edited();
++                    }
++                    return true;
++                default:
++                    return true;
++            }
++        }
++    }
++}
+diff --git a/android/app/src/main/java/net/veloren/android/Files.java b/android/app/src/main/java/net/veloren/android/Files.java
+new file mode 100644
+index 00000000..9247982b
+--- /dev/null
++++ b/android/app/src/main/java/net/veloren/android/Files.java
+@@ -0,0 +1,62 @@
++package net.veloren.android;
++
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++
++/** The few file operations the launcher needs (java.nio.file is newer than minSdk). */
++final class Files {
++    static byte[] read(File file) throws IOException {
++        try (InputStream input = new FileInputStream(file)) {
++            ByteArrayOutputStream output = new ByteArrayOutputStream();
++            copy(input, output);
++            return output.toByteArray();
++        }
++    }
++
++    /** Replaces {@code file} so that readers never see it half written. */
++    static void writeAtomically(File file, byte[] contents) throws IOException {
++        makeDirectories(file.getParentFile());
++        File temporary = new File(file.getPath() + ".tmp");
++        try (FileOutputStream output = new FileOutputStream(temporary)) {
++            output.write(contents);
++            output.getFD().sync();
++        }
++        if (!temporary.renameTo(file)) {
++            throw new IOException("Tidak bisa menyimpan " + file.getName());
++        }
++    }
++
++    static void copy(InputStream input, OutputStream output) throws IOException {
++        byte[] buffer = new byte[64 * 1024];
++        int count;
++        while ((count = input.read(buffer)) >= 0) {
++            output.write(buffer, 0, count);
++        }
++    }
++
++    static void makeDirectories(File directory) throws IOException {
++        if (!directory.isDirectory() && !directory.mkdirs() && !directory.isDirectory()) {
++            throw new IOException("Tidak bisa membuat folder " + directory.getName());
++        }
++    }
++
++    static void delete(File file) throws IOException {
++        File[] children = file.listFiles();
++        if (children != null) {
++            for (File child : children) {
++                delete(child);
++            }
++        }
++        if (file.exists() && !file.delete()) {
++            throw new IOException("Tidak bisa menghapus " + file.getName());
++        }
++    }
++
++    private Files() {
++    }
++}
 diff --git a/android/app/src/main/java/net/veloren/android/LauncherActivity.java b/android/app/src/main/java/net/veloren/android/LauncherActivity.java
 new file mode 100644
-index 00000000..36c77b4d
+index 00000000..b17b9547
 --- /dev/null
 +++ b/android/app/src/main/java/net/veloren/android/LauncherActivity.java
-@@ -0,0 +1,634 @@
+@@ -0,0 +1,1111 @@
 +package net.veloren.android;
 +
 +import android.app.Activity;
++import android.app.AlertDialog;
 +import android.app.DownloadManager;
 +import android.content.ActivityNotFoundException;
 +import android.content.Context;
@@ -85,21 +442,25 @@ index 00000000..36c77b4d
 +import android.content.pm.PackageManager;
 +import android.content.pm.Signature;
 +import android.database.Cursor;
-+import android.graphics.Color;
 +import android.net.Uri;
 +import android.os.Build;
 +import android.os.Bundle;
 +import android.os.Environment;
 +import android.os.Handler;
 +import android.os.Looper;
++import android.provider.OpenableColumns;
 +import android.provider.Settings;
 +import android.view.Gravity;
 +import android.view.View;
 +import android.widget.Button;
++import android.widget.CheckBox;
++import android.widget.FrameLayout;
 +import android.widget.LinearLayout;
 +import android.widget.ProgressBar;
 +import android.widget.ScrollView;
++import android.widget.SeekBar;
 +import android.widget.TextView;
++import android.widget.Toast;
 +
 +import org.json.JSONException;
 +import org.json.JSONObject;
@@ -113,9 +474,14 @@ index 00000000..36c77b4d
 +import java.nio.charset.StandardCharsets;
 +import java.security.MessageDigest;
 +import java.security.NoSuchAlgorithmException;
++import java.util.ArrayList;
++import java.util.List;
 +import java.util.Locale;
 +
-+/** First screen of the app: checks for updates, then starts the game. */
++/**
++ * First screen of the app: checks for updates, holds the player's choices (controls,
++ * resource packs, graphics) and starts the game.
++ */
 +public class LauncherActivity extends Activity {
 +    /** The weekly tag of the official repository is what the official server runs. */
 +    private static final String OFFICIAL_WEEKLY_URL =
@@ -126,6 +492,8 @@ index 00000000..36c77b4d
 +    private static final String PREF_SHA = "downloadSha";
 +    private static final int AUTO_START_SECONDS = 3;
 +    private static final long SPARE_BYTES = 200L * 1024 * 1024;
++    private static final int PICK_PACK = 1;
++    private static final String[] PAGES = {"Main", "Kontrol", "Resource Pack", "Grafis"};
 +
 +    private final Handler handler = new Handler(Looper.getMainLooper());
 +    private TextView status;
@@ -145,7 +513,22 @@ index 00000000..36c77b4d
 +    private boolean resumed;
 +    /** Countdown or download poll; only runs while the screen is in front. */
 +    private Runnable ticker;
++    private boolean countingDown;
 +    private int secondsLeft;
++
++    private File launcherDirectory;
++    private LauncherConfig config;
++    private ResourcePacks packs;
++    /** Set while resource packs are being changed in the background. */
++    private boolean packsBusy;
++
++    private View home;
++    private ControlEditor editor;
++    private final View[] pages = new View[PAGES.length];
++    private final Button[] tabs = new Button[PAGES.length];
++    private LinearLayout controlsPage;
++    private LinearLayout packsPage;
++    private LinearLayout graphicsPage;
 +
 +    @Override
 +    protected void onCreate(Bundle savedInstanceState) {
@@ -162,7 +545,12 @@ index 00000000..36c77b4d
 +        installedCommit = getString(R.string.launcher_upstream_commit);
 +        installedCode = readInstalledCode();
 +        installedSigner = readInstalledSigner();
++        launcherDirectory = new File(getFilesDir(), "launcher");
++        config = LauncherConfig.load(launcherDirectory);
++        saveConfig();
++        packs = new ResourcePacks(launcherDirectory);
 +        buildLayout();
++        showPage(0);
 +
 +        // The downloaded APK is large: delete it once it has been installed.
 +        long downloaded = prefs.getLong(PREF_CODE, 0);
@@ -196,12 +584,518 @@ index 00000000..36c77b4d
 +        super.onDestroy();
 +    }
 +
++    @Override
++    @SuppressWarnings("deprecation")
++    public void onBackPressed() {
++        if (editor != null) {
++            closeEditor();
++        } else if (pages[0] != null && pages[0].getVisibility() != View.VISIBLE) {
++            showPage(0);
++        } else {
++            super.onBackPressed();
++        }
++    }
++
 +    private void setTicker(Runnable next) {
 +        handler.removeCallbacksAndMessages(null);
++        countingDown = false;
 +        ticker = next;
 +        if (resumed && next != null) {
 +            handler.post(next);
 +        }
++    }
++
++    private void startGame() {
++        if (packsBusy) {
++            toast("Tunggu, resource pack sedang disiapkan.");
++            return;
++        }
++        if (!saveConfig()) {
++            return;
++        }
++        generation++;
++        setTicker(null);
++        startActivity(new Intent(this, VelorenGameActivity.class));
++        finish();
++    }
++
++    private boolean saveConfig() {
++        try {
++            config.save(launcherDirectory);
++            return true;
++        } catch (IOException e) {
++            toast("Pengaturan tidak bisa disimpan: " + e.getMessage());
++            return false;
++        }
++    }
++
++    private void toast(String message) {
++        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
++    }
++
++    // Layout
++
++    private void buildLayout() {
++        LinearLayout root = Widgets.row(this);
++        root.setBackgroundColor(Widgets.BACKGROUND);
++
++        LinearLayout sidebar = Widgets.column(this);
++        sidebar.setBackgroundColor(Widgets.SIDEBAR);
++        sidebar.setPadding(dp(10), dp(14), dp(10), dp(10));
++        TextView title = Widgets.text(this, "VELOREN", 22, Widgets.TEXT);
++        title.setGravity(Gravity.CENTER);
++        title.setLetterSpacing(0.15f);
++        Widgets.addWide(sidebar, title);
++        for (int index = 0; index < PAGES.length; index++) {
++            final int page = index;
++            tabs[index] = Widgets.button(this, PAGES[index], () -> {
++                stopCountdown();
++                showPage(page);
++            });
++            Widgets.addWide(sidebar, tabs[index]);
++        }
++        ScrollView sideScroll = new ScrollView(this);
++        sideScroll.setFillViewport(true);
++        sideScroll.setBackgroundColor(Widgets.SIDEBAR);
++        sideScroll.addView(sidebar);
++        root.addView(sideScroll,
++                new LinearLayout.LayoutParams(dp(170), LinearLayout.LayoutParams.MATCH_PARENT));
++
++        FrameLayout content = new FrameLayout(this);
++        controlsPage = Widgets.column(this);
++        packsPage = Widgets.column(this);
++        graphicsPage = Widgets.column(this);
++        LinearLayout mainPage = buildMainPage();
++        LinearLayout[] columns = {mainPage, controlsPage, packsPage, graphicsPage};
++        for (int index = 0; index < columns.length; index++) {
++            columns[index].setPadding(dp(18), dp(14), dp(18), dp(14));
++            ScrollView scroll = new ScrollView(this);
++            scroll.setFillViewport(true);
++            scroll.addView(columns[index]);
++            pages[index] = scroll;
++            content.addView(scroll);
++        }
++        root.addView(content,
++                new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1));
++        home = root;
++        setContentView(home);
++    }
++
++    private void showPage(int page) {
++        for (int index = 0; index < PAGES.length; index++) {
++            pages[index].setVisibility(index == page ? View.VISIBLE : View.GONE);
++            Widgets.highlight(tabs[index], index == page);
++        }
++        if (page == 1) {
++            refreshControls();
++        } else if (page == 2) {
++            refreshPacks();
++        } else if (page == 3) {
++            refreshGraphics();
++        }
++    }
++
++    private LinearLayout buildMainPage() {
++        LinearLayout page = Widgets.column(this);
++        page.setGravity(Gravity.CENTER_HORIZONTAL);
++        TextView version = Widgets.text(this, installedCommit.isEmpty()
++                ? "Terpasang: versi tidak diketahui"
++                : "Terpasang: " + describe(installedCommit,
++                        getString(R.string.launcher_upstream_date)), 13, Widgets.MUTED);
++        version.setGravity(Gravity.CENTER);
++        Widgets.addWide(page, version);
++
++        LinearLayout card = Widgets.card(this);
++        card.setGravity(Gravity.CENTER_HORIZONTAL);
++        status = Widgets.text(this, "", 18, Widgets.TEXT);
++        status.setGravity(Gravity.CENTER);
++        detail = Widgets.text(this, "", 13, Widgets.MUTED);
++        detail.setGravity(Gravity.CENTER);
++        progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
++        progress.setMax(1000);
++        buttons = Widgets.row(this);
++        buttons.setGravity(Gravity.CENTER);
++        Widgets.addWide(card, status);
++        Widgets.addWide(card, detail);
++        Widgets.addWide(card, progress);
++        Widgets.add(card, buttons);
++        Widgets.addWide(page, card);
++
++        Button play = Widgets.button(this, "▶  MAIN", this::startGame);
++        play.setTextSize(24);
++        Widgets.highlight(play, true);
++        play.setPadding(dp(60), dp(14), dp(60), dp(14));
++        Widgets.add(page, play);
++
++        CheckBox auto = new CheckBox(this);
++        auto.setText("Masuk game otomatis kalau sudah versi terbaru");
++        auto.setTextColor(Widgets.MUTED);
++        auto.setChecked(config.autoStart);
++        auto.setOnCheckedChangeListener((view, checked) -> {
++            config.autoStart = checked;
++            saveConfig();
++            if (!checked) {
++                stopCountdown();
++            }
++        });
++        Widgets.add(page, auto);
++        return page;
++    }
++
++    // Controls page
++
++    private void refreshControls() {
++        controlsPage.removeAllViews();
++
++        LinearLayout movement = choiceCard("Kontrol gerak", "Seret jari di joystick, atau "
++                + "tekan panah D-pad.");
++        LinearLayout movementRow = Widgets.row(this);
++        choice(movementRow, "Joystick", !config.dpad, () -> {
++            config.dpad = false;
++            controlsChanged();
++        });
++        choice(movementRow, "D-pad", config.dpad, () -> {
++            config.dpad = true;
++            controlsChanged();
++        });
++        Widgets.add(movement, movementRow);
++
++        LinearLayout layout = choiceCard("Posisi tombol", LauncherConfig.LAYOUT_ORIGINAL
++                .equals(config.layout)
++                ? "Memakai tata letak asli port. Pilih Minecraft untuk bisa mengaturnya."
++                : "Geser, besarkan, sembunyikan, atau tambah tombol.");
++        LinearLayout layoutRow = Widgets.row(this);
++        choice(layoutRow, "Minecraft",
++                LauncherConfig.LAYOUT_MINECRAFT.equals(config.layout), () -> {
++                    confirmIfCustom(() -> {
++                        config.useMinecraftLayout();
++                        controlsChanged();
++                    });
++                });
++        choice(layoutRow, "Asli",
++                LauncherConfig.LAYOUT_ORIGINAL.equals(config.layout), () -> {
++                    confirmIfCustom(() -> {
++                        config.useOriginalLayout();
++                        controlsChanged();
++                    });
++                });
++        Button edit = Widgets.button(this, "Atur posisi tombol…", this::openEditor);
++        edit.setEnabled(!LauncherConfig.LAYOUT_ORIGINAL.equals(config.layout));
++        edit.setAlpha(edit.isEnabled() ? 1 : 0.4f);
++        Widgets.add(layoutRow, edit);
++        Widgets.add(layout, layoutRow);
++
++        LinearLayout look = choiceCard("Transparansi tombol",
++                Math.round(config.opacity * 100) + "%");
++        TextView percent = (TextView) look.getChildAt(1);
++        SeekBar bar = new SeekBar(this);
++        bar.setMax(80);
++        bar.setProgress(Math.round(config.opacity * 100) - 20);
++        bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
++            @Override
++            public void onProgressChanged(SeekBar seekBar, int value, boolean fromUser) {
++                config.opacity = (value + 20) / 100f;
++                percent.setText(Math.round(config.opacity * 100) + "%");
++            }
++
++            @Override
++            public void onStartTrackingTouch(SeekBar seekBar) {
++            }
++
++            @Override
++            public void onStopTrackingTouch(SeekBar seekBar) {
++                saveConfig();
++            }
++        });
++        Widgets.addWide(look, bar);
++
++        Widgets.addWide(controlsPage, movement);
++        Widgets.addWide(controlsPage, layout);
++        Widgets.addWide(controlsPage, look);
++    }
++
++    private void controlsChanged() {
++        saveConfig();
++        refreshControls();
++    }
++
++    private void confirmIfCustom(Runnable action) {
++        if (!LauncherConfig.LAYOUT_CUSTOM.equals(config.layout)) {
++            action.run();
++            return;
++        }
++        new AlertDialog.Builder(this)
++                .setMessage("Posisi tombol buatan Anda akan diganti. Lanjutkan?")
++                .setPositiveButton("Ganti", (dialog, which) -> action.run())
++                .setNegativeButton("Batal", null)
++                .show();
++    }
++
++    private void openEditor() {
++        editor = new ControlEditor(this, config, this::saveConfig, this::closeEditor);
++        setContentView(editor);
++        showFullScreen(true);
++    }
++
++    private void closeEditor() {
++        editor = null;
++        saveConfig();
++        showFullScreen(false);
++        setContentView(home);
++        refreshControls();
++    }
++
++    /** Hides the system bars so the editor covers the same area as the game. */
++    @SuppressWarnings("deprecation")
++    private void showFullScreen(boolean immersive) {
++        getWindow().getDecorView().setSystemUiVisibility(immersive
++                ? View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
++                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
++                        | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
++                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
++                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
++                : View.SYSTEM_UI_FLAG_VISIBLE);
++    }
++
++    private LinearLayout choiceCard(String title, String explanation) {
++        LinearLayout card = Widgets.card(this);
++        Widgets.addWide(card, Widgets.text(this, title, 16, Widgets.TEXT));
++        Widgets.addWide(card, Widgets.text(this, explanation, 12, Widgets.MUTED));
++        return card;
++    }
++
++    private void choice(LinearLayout row, String label, boolean selected, Runnable action) {
++        Button button = Widgets.button(this, label, action);
++        Widgets.highlight(button, selected);
++        Widgets.add(row, button);
++    }
++
++    // Resource pack page
++
++    private void refreshPacks() {
++        packsPage.removeAllViews();
++        LinearLayout intro = choiceCard("Resource pack",
++                "Zip berisi folder seperti di assets game, misalnya "
++                        + "voxygen/element/ui/touch/jump.png. Pack paling atas menang. "
++                        + "Berlaku saat game dibuka.");
++        Button add = Widgets.button(this, "Impor .zip", this::pickPack);
++        add.setEnabled(!packsBusy);
++        Widgets.add(intro, add);
++        Widgets.addWide(packsPage, intro);
++
++        if (packsBusy) {
++            Widgets.add(packsPage, new ProgressBar(this));
++            return;
++        }
++        List<ResourcePacks.Pack> list;
++        try {
++            list = packs.list();
++        } catch (IOException e) {
++            list = new ArrayList<>();
++            toast("Daftar resource pack tidak bisa dibaca: " + e.getMessage());
++        }
++        if (list.isEmpty()) {
++            Widgets.add(packsPage,
++                    Widgets.text(this, "Belum ada resource pack.", 13, Widgets.MUTED));
++        }
++        for (ResourcePacks.Pack pack : list) {
++            LinearLayout card = Widgets.card(this);
++            card.setOrientation(LinearLayout.HORIZONTAL);
++            card.setGravity(Gravity.CENTER_VERTICAL);
++            CheckBox enabled = new CheckBox(this);
++            enabled.setText(pack.name);
++            enabled.setTextColor(Widgets.TEXT);
++            enabled.setChecked(pack.enabled);
++            enabled.setOnCheckedChangeListener((view, checked) ->
++                    changePacks(() -> packs.setEnabled(pack.name, checked)));
++            card.addView(enabled, new LinearLayout.LayoutParams(0,
++                    LinearLayout.LayoutParams.WRAP_CONTENT, 1));
++            Widgets.add(card, Widgets.button(this, "▲",
++                    () -> changePacks(() -> packs.move(pack.name, -1))));
++            Widgets.add(card, Widgets.button(this, "▼",
++                    () -> changePacks(() -> packs.move(pack.name, 1))));
++            Widgets.add(card, Widgets.button(this, "Hapus", () -> new AlertDialog.Builder(this)
++                    .setMessage("Hapus resource pack \"" + pack.name + "\"?")
++                    .setPositiveButton("Hapus",
++                            (dialog, which) -> changePacks(() -> packs.remove(pack.name)))
++                    .setNegativeButton("Batal", null)
++                    .show()));
++            Widgets.addWide(packsPage, card);
++        }
++    }
++
++    private interface PackChange {
++        void run() throws IOException;
++    }
++
++    /** Performs a change and rebuilds the merged folder away from the UI thread. */
++    private void changePacks(PackChange change) {
++        if (packsBusy) {
++            return;
++        }
++        stopCountdown();
++        packsBusy = true;
++        refreshPacks();
++        new Thread(() -> {
++            String problem = null;
++            try {
++                try {
++                    change.run();
++                } finally {
++                    packs.apply();
++                }
++            } catch (IOException | RuntimeException e) {
++                problem = e.getMessage();
++            }
++            final String failed = problem;
++            runOnUiThread(() -> {
++                packsBusy = false;
++                if (!isDestroyed()) {
++                    if (failed != null) {
++                        toast(failed);
++                    }
++                    refreshPacks();
++                }
++            });
++        }, "resource-packs").start();
++    }
++
++    private void pickPack() {
++        Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT)
++                .addCategory(Intent.CATEGORY_OPENABLE)
++                .setType("*/*")
++                .putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
++                    "application/zip", "application/x-zip-compressed",
++                    "application/octet-stream"
++                });
++        try {
++            startActivityForResult(pick, PICK_PACK);
++        } catch (ActivityNotFoundException e) {
++            toast("Tidak ada aplikasi pemilih berkas.");
++        }
++    }
++
++    @Override
++    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
++        super.onActivityResult(requestCode, resultCode, data);
++        if (requestCode != PICK_PACK || resultCode != RESULT_OK || data == null
++                || data.getData() == null) {
++            return;
++        }
++        Uri uri = data.getData();
++        changePacks(() -> {
++            String name = displayName(uri);
++            try (InputStream input = getContentResolver().openInputStream(uri)) {
++                if (input == null) {
++                    throw new IOException("Berkas tidak bisa dibuka.");
++                }
++                packs.importZip(input, name);
++            }
++        });
++    }
++
++    private String displayName(Uri uri) {
++        try (Cursor cursor = getContentResolver().query(
++                uri, new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
++            if (cursor != null && cursor.moveToFirst() && cursor.getString(0) != null) {
++                return cursor.getString(0);
++            }
++        }
++        return "pack";
++    }
++
++    // Graphics page
++
++    private void refreshGraphics() {
++        graphicsPage.removeAllViews();
++        boolean ours = config.graphicsRevision != 0;
++        LinearLayout presets = choiceCard("Optimasi", ours
++                ? "Diterapkan sekali saat game dibuka; perubahan di menu game tetap disimpan."
++                : "Mengikuti pengaturan di menu game.");
++        LinearLayout presetRow = Widgets.row(this);
++        choice(presetRow, "Ikuti game", !ours, () -> {
++            config.graphicsRevision = 0;
++            graphicsChanged(false);
++        });
++        preset(presetRow, "Hemat", 0.5f, 4, 30, false);
++        preset(presetRow, "Seimbang", 0.65f, 6, 30, true);
++        preset(presetRow, "Tajam", 1.0f, 7, 60, true);
++        Widgets.add(presets, presetRow);
++        Widgets.addWide(graphicsPage, presets);
++
++        LinearLayout scale = choiceCard("Resolusi render",
++                "Makin kecil makin ringan, makin besar makin tajam.");
++        LinearLayout scaleRow = Widgets.row(this);
++        for (float value : new float[] {0.4f, 0.5f, 0.65f, 0.8f, 1.0f}) {
++            choice(scaleRow, Math.round(value * 100) + "%",
++                    ours && Math.abs(config.renderScale - value) < 0.01f, () -> {
++                        config.renderScale = value;
++                        graphicsChanged(true);
++                    });
++        }
++        Widgets.add(scale, scaleRow);
++        Widgets.addWide(graphicsPage, scale);
++
++        LinearLayout distance = choiceCard("Jarak pandang", "Dalam chunk.");
++        LinearLayout distanceRow = Widgets.row(this);
++        for (int value : new int[] {3, 4, 5, 6, 7, 10}) {
++            choice(distanceRow, String.valueOf(value), ours && config.viewDistance == value,
++                    () -> {
++                        config.viewDistance = value;
++                        graphicsChanged(true);
++                    });
++        }
++        Widgets.add(distance, distanceRow);
++        Widgets.addWide(graphicsPage, distance);
++
++        LinearLayout frames = choiceCard("Batas FPS", "30 lebih hemat baterai dan panas.");
++        LinearLayout framesRow = Widgets.row(this);
++        for (int value : new int[] {30, 45, 60}) {
++            choice(framesRow, String.valueOf(value), ours && config.maxFps == value, () -> {
++                config.maxFps = value;
++                graphicsChanged(true);
++            });
++        }
++        Widgets.add(frames, framesRow);
++        Widgets.addWide(graphicsPage, frames);
++
++        LinearLayout shadow = choiceCard("Bayangan",
++                "Matikan kalau gambar terlihat rusak atau lambat.");
++        LinearLayout shadowRow = Widgets.row(this);
++        choice(shadowRow, "Nyala", ours && config.shadows, () -> {
++            config.shadows = true;
++            graphicsChanged(true);
++        });
++        choice(shadowRow, "Mati", ours && !config.shadows, () -> {
++            config.shadows = false;
++            graphicsChanged(true);
++        });
++        Widgets.add(shadow, shadowRow);
++        Widgets.addWide(graphicsPage, shadow);
++    }
++
++    private void preset(LinearLayout row, String label, float scale, int distance, int fps,
++            boolean shadows) {
++        boolean selected = config.graphicsRevision != 0
++                && Math.abs(config.renderScale - scale) < 0.01f
++                && config.viewDistance == distance && config.maxFps == fps
++                && config.shadows == shadows;
++        choice(row, label, selected, () -> {
++            config.renderScale = scale;
++            config.viewDistance = distance;
++            config.maxFps = fps;
++            config.shadows = shadows;
++            graphicsChanged(true);
++        });
++    }
++
++    private void graphicsChanged(boolean apply) {
++        if (apply) {
++            // A new revision makes the game apply the choices once more.
++            config.graphicsRevision = System.currentTimeMillis();
++        }
++        saveConfig();
++        refreshGraphics();
 +    }
 +
 +    // Update check
@@ -209,7 +1103,7 @@ index 00000000..36c77b4d
 +    private void checkForUpdate() {
 +        final int mine = ++generation;
 +        setTicker(null);
-+        show("Mengecek update…", "", button("Lewati dan main", this::startGame));
++        show("Mengecek update…", "");
 +        progress.setVisibility(View.VISIBLE);
 +        progress.setIndeterminate(true);
 +
@@ -260,7 +1154,7 @@ index 00000000..36c77b4d
 +        switch (UpdateDecision.decide(installedCode, installedCommit, installedSigner, release,
 +                officialCommit)) {
 +            case UP_TO_DATE:
-+                countDown();
++                upToDate();
 +                break;
 +            case APK_UPDATE:
 +                offerUpdate(release, "");
@@ -270,15 +1164,13 @@ index 00000000..36c77b4d
 +                        "APK terbaru ditandatangani dengan kunci berbeda. Hapus aplikasi ini "
 +                                + "(pengaturan akan hilang), lalu pasang APK dari halaman rilis.",
 +                        button("Buka halaman rilis",
-+                                () -> browse("https://github.com/" + repo + "/releases/latest")),
-+                        button("Main versi ini", this::startGame));
++                                () -> browse("https://github.com/" + repo + "/releases/latest")));
 +                break;
 +            case BUILD_PENDING:
 +                show("Veloren resmi punya versi baru",
 +                        "Versi mingguan " + describe(officialCommit, officialDate)
 +                                + " belum tersedia sebagai APK. Build otomatis berjalan berkala, "
 +                                + "cek lagi nanti.",
-+                        button("Main versi ini", this::startGame),
 +                        button("Cek lagi", this::checkForUpdate),
 +                        button("Lihat build",
 +                                () -> browse("https://github.com/" + repo + "/actions")));
@@ -288,21 +1180,20 @@ index 00000000..36c77b4d
 +                        problem.isEmpty()
 +                                ? "Versi APK ini tidak diketahui."
 +                                : problem,
-+                        button("Main", this::startGame),
 +                        button("Cek lagi", this::checkForUpdate));
 +                break;
 +        }
 +    }
 +
-+    private void countDown() {
++    private void upToDate() {
++        // Do not leave for the game while the player is busy elsewhere in the launcher.
++        if (!config.autoStart || packsBusy || editor != null
++                || pages[0].getVisibility() != View.VISIBLE) {
++            show("Sudah versi terbaru", "", button("Cek lagi", this::checkForUpdate));
++            return;
++        }
 +        secondsLeft = AUTO_START_SECONDS;
-+        show("Sudah versi terbaru", "",
-+                button("Main sekarang", this::startGame),
-+                button("Tunggu", () -> {
-+                    setTicker(null);
-+                    detail.setText("");
-+                }),
-+                button("Cek lagi", this::checkForUpdate));
++        show("Sudah versi terbaru", "", button("Tunggu", this::stopCountdown));
 +        setTicker(new Runnable() {
 +            @Override
 +            public void run() {
@@ -315,13 +1206,14 @@ index 00000000..36c77b4d
 +                handler.postDelayed(this, 1000);
 +            }
 +        });
++        countingDown = true;
 +    }
 +
-+    private void startGame() {
-+        generation++;
-+        setTicker(null);
-+        startActivity(new Intent(this, VelorenGameActivity.class));
-+        finish();
++    private void stopCountdown() {
++        if (countingDown) {
++            setTicker(null);
++            show("Sudah versi terbaru", "", button("Cek lagi", this::checkForUpdate));
++        }
 +    }
 +
 +    // Download and installation
@@ -330,8 +1222,7 @@ index 00000000..36c77b4d
 +        String text = "Veloren " + describe(release.commit, release.date) + ", "
 +                + megabytes(release.size) + " MB. Disarankan memakai Wi-Fi.";
 +        show("Update tersedia", note.isEmpty() ? text : note + "\n" + text,
-+                button("Unduh update", () -> startDownload(release)),
-+                button("Main dulu", this::startGame));
++                button("Unduh update", () -> startDownload(release)));
 +    }
 +
 +    private void startDownload(UpdateDecision.Release release) {
@@ -384,7 +1275,6 @@ index 00000000..36c77b4d
 +    private void trackDownload() {
 +        final long id = prefs.getLong(PREF_ID, -1);
 +        show("Mengunduh update…", "",
-+                button("Main dulu", this::startGame),
 +                button("Batalkan", () -> {
 +                    forgetDownload();
 +                    checkForUpdate();
@@ -439,7 +1329,7 @@ index 00000000..36c77b4d
 +        final int mine = ++generation;
 +        final String expected = prefs.getString(PREF_SHA, "");
 +        setTicker(null);
-+        show("Memeriksa berkas…", "", button("Main dulu", this::startGame));
++        show("Memeriksa berkas…", "");
 +        progress.setVisibility(View.VISIBLE);
 +        progress.setIndeterminate(true);
 +        new Thread(() -> {
@@ -481,7 +1371,6 @@ index 00000000..36c77b4d
 +        show("Update siap dipasang",
 +                "Data game akan disiapkan ulang saat pertama dibuka setelah update.",
 +                button("Pasang", () -> install(id)),
-+                button("Main dulu", this::startGame),
 +                button("Hapus unduhan", () -> {
 +                    forgetDownload();
 +                    checkForUpdate();
@@ -510,9 +1399,7 @@ index 00000000..36c77b4d
 +    private void downloadFailed(String message) {
 +        forgetDownload();
 +        setTicker(null);
-+        show("Update gagal", message,
-+                button("Cek lagi", this::checkForUpdate),
-+                button("Main", this::startGame));
++        show("Update gagal", message, button("Cek lagi", this::checkForUpdate));
 +    }
 +
 +    private void forgetDownload() {
@@ -543,6 +1430,20 @@ index 00000000..36c77b4d
 +        } catch (ActivityNotFoundException e) {
 +            detail.setText(address);
 +        }
++    }
++
++    private void show(String headline, String explanation, Button... actions) {
++        status.setText(headline);
++        detail.setText(explanation);
++        progress.setVisibility(View.GONE);
++        buttons.removeAllViews();
++        for (Button action : actions) {
++            Widgets.add(buttons, action);
++        }
++    }
++
++    private Button button(String label, Runnable action) {
++        return Widgets.button(this, label, action);
 +    }
 +
 +    // Installed version
@@ -635,76 +1536,607 @@ index 00000000..36c77b4d
 +        return date.length() >= 10 ? id + " (" + date.substring(0, 10) + ")" : id;
 +    }
 +
-+    // Layout
-+
-+    private void buildLayout() {
-+        LinearLayout column = new LinearLayout(this);
-+        column.setOrientation(LinearLayout.VERTICAL);
-+        column.setGravity(Gravity.CENTER);
-+        column.setPadding(dp(32), dp(20), dp(32), dp(20));
-+
-+        TextView title = text(34, Color.WHITE);
-+        title.setText("Veloren");
-+        TextView version = text(13, Color.rgb(140, 150, 165));
-+        version.setText(installedCommit.isEmpty()
-+                ? "Terpasang: versi tidak diketahui"
-+                : "Terpasang: " + describe(installedCommit,
-+                        getString(R.string.launcher_upstream_date)));
-+        status = text(20, Color.WHITE);
-+        status.setPadding(0, dp(18), 0, dp(6));
-+        detail = text(14, Color.rgb(190, 200, 215));
-+        progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-+        progress.setMax(1000);
-+        buttons = new LinearLayout(this);
-+        buttons.setGravity(Gravity.CENTER);
-+        buttons.setPadding(0, dp(18), 0, 0);
-+
-+        column.addView(title);
-+        column.addView(version);
-+        column.addView(status);
-+        column.addView(detail);
-+        column.addView(progress, new LinearLayout.LayoutParams(dp(360), dp(24)));
-+        column.addView(buttons);
-+
-+        ScrollView scroll = new ScrollView(this);
-+        scroll.setFillViewport(true);
-+        scroll.setBackgroundColor(Color.rgb(16, 20, 28));
-+        scroll.addView(column);
-+        setContentView(scroll);
++    private int dp(int value) {
++        return Widgets.dp(this, value);
 +    }
++}
+diff --git a/android/app/src/main/java/net/veloren/android/LauncherConfig.java b/android/app/src/main/java/net/veloren/android/LauncherConfig.java
+new file mode 100644
+index 00000000..1c333d22
+--- /dev/null
++++ b/android/app/src/main/java/net/veloren/android/LauncherConfig.java
+@@ -0,0 +1,316 @@
++package net.veloren.android;
 +
-+    private TextView text(int size, int color) {
-+        TextView view = new TextView(this);
-+        view.setTextSize(size);
-+        view.setTextColor(color);
-+        view.setGravity(Gravity.CENTER);
-+        return view;
-+    }
++import java.io.File;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
 +
-+    private void show(String headline, String explanation, Button... actions) {
-+        status.setText(headline);
-+        detail.setText(explanation);
-+        progress.setVisibility(View.GONE);
-+        buttons.removeAllViews();
-+        for (Button action : actions) {
-+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-+                    LinearLayout.LayoutParams.WRAP_CONTENT,
-+                    LinearLayout.LayoutParams.WRAP_CONTENT);
-+            params.setMargins(dp(6), 0, dp(6), 0);
-+            buttons.addView(action, params);
++/**
++ * The player's choices, stored in {@code launcher/config.txt}. The game reads the same
++ * file (voxygen/src/launcher_config.rs). Free of Android classes so it can be tested.
++ */
++final class LauncherConfig {
++    static final String FILE = "config.txt";
++    static final String LAYOUT_MINECRAFT = "minecraft";
++    static final String LAYOUT_ORIGINAL = "asli";
++    static final String LAYOUT_CUSTOM = "kustom";
++
++    /** Where a button is: anchor L, C or R, offset and row in screen heights. */
++    static final class Spot {
++        char anchor;
++        float offset;
++        float row;
++        float scale;
++        boolean visible;
++
++        Spot(char anchor, float offset, float row, float scale, boolean visible) {
++            this.anchor = anchor;
++            this.offset = offset;
++            this.row = row;
++            this.scale = scale;
++            this.visible = visible;
++        }
++
++        float x(float width, float height) {
++            float x = anchor == 'L' ? offset * height
++                    : anchor == 'R' ? width - offset * height
++                    : width / 2 + offset * height;
++            return clamp(x, 0, width);
++        }
++
++        float y(float height) {
++            return row * height;
++        }
++
++        /** Moves to a point on screen, anchored to whichever third it lies in. */
++        void moveTo(float x, float y, float width, float height) {
++            x = clamp(x, 0, width);
++            if (x < width / 3) {
++                anchor = 'L';
++                offset = x / height;
++            } else if (x > width * 2 / 3) {
++                anchor = 'R';
++                offset = (width - x) / height;
++            } else {
++                anchor = 'C';
++                offset = (x - width / 2) / height;
++            }
++            row = clamp(y / height, 0, 1);
 +        }
 +    }
 +
-+    private Button button(String label, Runnable action) {
-+        Button view = new Button(this);
-+        view.setText(label);
-+        view.setAllCaps(false);
-+        view.setOnClickListener(ignored -> action.run());
-+        return view;
++    /** One button the game can show. Names and sizes match touch_buttons.rs. */
++    static final class Button {
++        final String id;
++        final String label;
++        /** Diameter as a fraction of the screen height. */
++        final float diameter;
++        /** Only shown when it applies; unless placed, it lives in a grid of the game. */
++        final boolean optional;
++
++        private Button(String id, String label, float diameter, boolean optional) {
++            this.id = id;
++            this.label = label;
++            this.diameter = diameter;
++            this.optional = optional;
++        }
 +    }
 +
-+    private int dp(int value) {
-+        return Math.round(value * getResources().getDisplayMetrics().density);
++    static final Map<String, Button> BUTTONS;
++
++    static {
++        Map<String, Button> all = new LinkedHashMap<>();
++        fixed(all, "move", "Gerak", 0.30f);
++        fixed(all, "attack", "Serang", 0.18f);
++        fixed(all, "jump", "Lompat", 0.13f);
++        fixed(all, "alt", "Alt", 0.13f);
++        fixed(all, "roll", "Guling", 0.13f);
++        fixed(all, "interact", "Aksi", 0.13f);
++        fixed(all, "state", "Turun", 0.13f);
++        fixed(all, "inventory", "Tas", 0.085f);
++        fixed(all, "diary", "Diari", 0.085f);
++        fixed(all, "menu", "Menu", 0.085f);
++        fixed(all, "more", "Lain", 0.085f);
++        fixed(all, "extra", "Ekstra", 0.085f);
++        for (int slot = 1; slot <= 5; slot++) {
++            fixed(all, "slot" + slot, String.valueOf(slot), 0.089f);
++        }
++        fixed(all, "slotpage", "6-10", 0.089f);
++        String[][] optional = {
++            {"sneak", "Jongkok"}, {"chat", "Chat"}, {"map", "Peta"}, {"swap", "Ganti"},
++            {"draw", "Senjata"}, {"block", "Tangkis"}, {"lantern", "Lampu"},
++            {"glide", "Terbang"}, {"mount", "Naik"}, {"trade", "Dagang"}, {"stay", "Diam"},
++            {"sit", "Duduk"}, {"crawl", "Rayap"}, {"dance", "Joget"}, {"greet", "Sapa"},
++            {"zoomin", "Zoom +"}, {"zoomout", "Zoom -"}, {"zoomlock", "Kunci zoom"},
++            {"type", "Ketik"}, {"crafting", "Craft"}, {"social", "Sosial"},
++            {"autowalk", "Jalan auto"}, {"walk", "Pelan"}, {"camera", "Kamera"},
++            {"select", "Target"}, {"accept", "Terima"}, {"decline", "Tolak"},
++        };
++        for (String[] entry : optional) {
++            all.put(entry[0], new Button(entry[0], entry[1], 0.13f, true));
++        }
++        BUTTONS = Collections.unmodifiableMap(all);
++    }
++
++    private static void fixed(Map<String, Button> all, String id, String label, float size) {
++        all.put(id, new Button(id, label, size, false));
++    }
++
++    /** Buttons that must stay on screen. */
++    static boolean canHide(String id) {
++        return !id.equals("move") && !id.equals("menu");
++    }
++
++    String layout = LAYOUT_MINECRAFT;
++    boolean dpad;
++    float opacity = 1;
++    boolean autoStart = true;
++    final Map<String, Spot> spots = new LinkedHashMap<>();
++
++    /** 0 leaves the graphics to the in-game settings. */
++    long graphicsRevision;
++    float renderScale = 0.5f;
++    int viewDistance = 5;
++    int maxFps = 30;
++    boolean shadows = true;
++
++    /** A fresh configuration: the Minecraft-like layout. */
++    static LauncherConfig defaults() {
++        LauncherConfig config = new LauncherConfig();
++        config.useMinecraftLayout();
++        return config;
++    }
++
++    /**
++     * Movement bottom left, jump and actions bottom right, hotbar along the bottom and
++     * menus along the top, as in the touch versions of block games.
++     */
++    void useMinecraftLayout() {
++        layout = LAYOUT_MINECRAFT;
++        spots.clear();
++        put("move", 'L', 0.22f, 0.74f, 1);
++        put("jump", 'R', 0.15f, 0.78f, 1.2f);
++        put("attack", 'R', 0.15f, 0.55f, 1);
++        put("interact", 'R', 0.15f, 0.32f, 1);
++        put("sneak", 'R', 0.37f, 0.84f, 1);
++        put("alt", 'R', 0.38f, 0.66f, 1);
++        put("roll", 'R', 0.38f, 0.46f, 1);
++        put("state", 'R', 0.38f, 0.28f, 1);
++        put("diary", 'C', -0.24f, 0.09f, 1);
++        // Optional buttons are larger; scaled to the size of the other menu buttons.
++        put("chat", 'C', -0.12f, 0.09f, 0.65f);
++        put("menu", 'C', 0, 0.09f, 1);
++        put("extra", 'C', 0.12f, 0.09f, 1);
++        put("more", 'C', 0.24f, 0.09f, 1);
++        put("inventory", 'C', -0.34f, 0.925f, 1);
++        for (int slot = 1; slot <= 5; slot++) {
++            put("slot" + slot, 'C', (slot - 3) * 0.11f, 0.925f, 1);
++        }
++        put("slotpage", 'C', 0.34f, 0.925f, 1);
++    }
++
++    /** The layout the Android port ships with. */
++    void useOriginalLayout() {
++        layout = LAYOUT_ORIGINAL;
++        spots.clear();
++    }
++
++    private void put(String id, char anchor, float offset, float row, float scale) {
++        spots.put(id, new Spot(anchor, offset, row, scale, true));
++    }
++
++    String serialize() {
++        StringBuilder text = new StringBuilder("# Ditulis oleh launcher Veloren\n");
++        line(text, "layout", layout);
++        line(text, "autostart", autoStart ? "1" : "0");
++        line(text, "movement", dpad ? "dpad" : "joystick");
++        line(text, "opacity", decimal(opacity));
++        for (Map.Entry<String, Spot> entry : spots.entrySet()) {
++            Spot spot = entry.getValue();
++            line(text, "button." + entry.getKey(), spot.anchor + "," + decimal(spot.offset)
++                    + "," + decimal(spot.row) + "," + decimal(spot.scale) + ","
++                    + (spot.visible ? "1" : "0"));
++        }
++        if (graphicsRevision != 0) {
++            line(text, "perf.revision", String.valueOf(graphicsRevision));
++            line(text, "perf.render_scale", decimal(renderScale));
++            line(text, "perf.view_distance", String.valueOf(viewDistance));
++            line(text, "perf.max_fps", String.valueOf(maxFps));
++            line(text, "perf.shadows", shadows ? "1" : "0");
++        }
++        return text.toString();
++    }
++
++    /** Reads a stored file; anything missing or invalid keeps its default. */
++    static LauncherConfig parse(String text) {
++        LauncherConfig config = new LauncherConfig();
++        for (String line : text.split("\n")) {
++            int split = line.indexOf('=');
++            if (split < 0 || line.startsWith("#")) {
++                continue;
++            }
++            String key = line.substring(0, split).trim();
++            String value = line.substring(split + 1).trim();
++            try {
++                if (key.startsWith("button.")) {
++                    String[] parts = value.split(",");
++                    if (parts.length != 5 || !parts[0].matches("[LCR]")) {
++                        continue;
++                    }
++                    config.spots.put(key.substring("button.".length()), new Spot(
++                            parts[0].charAt(0), finite(parts[1], -3, 3), finite(parts[2], 0, 1),
++                            finite(parts[3], 0.5f, 2), !parts[4].equals("0")));
++                    continue;
++                }
++                switch (key) {
++                    case "layout":
++                        config.layout = value;
++                        break;
++                    case "autostart":
++                        config.autoStart = !value.equals("0");
++                        break;
++                    case "movement":
++                        config.dpad = value.equals("dpad");
++                        break;
++                    case "opacity":
++                        config.opacity = finite(value, 0.2f, 1);
++                        break;
++                    case "perf.revision":
++                        config.graphicsRevision = Long.parseLong(value);
++                        break;
++                    case "perf.render_scale":
++                        config.renderScale = finite(value, 0.25f, 1);
++                        break;
++                    case "perf.view_distance":
++                        config.viewDistance = Integer.parseInt(value);
++                        break;
++                    case "perf.max_fps":
++                        config.maxFps = Integer.parseInt(value);
++                        break;
++                    case "perf.shadows":
++                        config.shadows = !value.equals("0");
++                        break;
++                    default:
++                        break;
++                }
++            } catch (NumberFormatException e) {
++                // Keep the default for this line.
++            }
++        }
++        return config;
++    }
++
++    /** Loads from {@code directory}, falling back to the defaults. */
++    static LauncherConfig load(File directory) {
++        File file = new File(directory, FILE);
++        if (!file.isFile()) {
++            return defaults();
++        }
++        try {
++            return parse(new String(Files.read(file), StandardCharsets.UTF_8));
++        } catch (IOException e) {
++            return defaults();
++        }
++    }
++
++    void save(File directory) throws IOException {
++        Files.writeAtomically(new File(directory, FILE),
++                serialize().getBytes(StandardCharsets.UTF_8));
++    }
++
++    /** Optional buttons that have not been placed yet. */
++    List<Button> unplaced() {
++        List<Button> missing = new ArrayList<>();
++        for (Button button : BUTTONS.values()) {
++            if (!spots.containsKey(button.id)) {
++                missing.add(button);
++            }
++        }
++        return missing;
++    }
++
++    private static void line(StringBuilder text, String key, String value) {
++        text.append(key).append('=').append(value).append('\n');
++    }
++
++    private static String decimal(float value) {
++        return String.format(Locale.ROOT, "%.4f", value);
++    }
++
++    private static float finite(String text, float min, float max) {
++        float value = Float.parseFloat(text.trim());
++        if (Float.isNaN(value) || Float.isInfinite(value)) {
++            throw new NumberFormatException(text);
++        }
++        return clamp(value, min, max);
++    }
++
++    static float clamp(float value, float min, float max) {
++        return Math.max(min, Math.min(max, value));
++    }
++}
+diff --git a/android/app/src/main/java/net/veloren/android/ResourcePacks.java b/android/app/src/main/java/net/veloren/android/ResourcePacks.java
+new file mode 100644
+index 00000000..b759845a
+--- /dev/null
++++ b/android/app/src/main/java/net/veloren/android/ResourcePacks.java
+@@ -0,0 +1,271 @@
++package net.veloren.android;
++
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.zip.ZipEntry;
++import java.util.zip.ZipInputStream;
++
++/**
++ * Resource packs: zip files that mirror the game's assets folder. Each is unpacked to
++ * {@code launcher/packs/<name>}; the enabled ones are merged into
++ * {@code launcher/override}, which the game reads before its own assets.
++ *
++ * <p>The list is ordered by priority: a file in a higher pack wins.
++ */
++final class ResourcePacks {
++    static final class Pack {
++        final String name;
++        boolean enabled;
++
++        Pack(String name, boolean enabled) {
++            this.name = name;
++            this.enabled = enabled;
++        }
++    }
++
++    /** Top folders of the game's assets; a pack must contain at least one. */
++    private static final List<String> ASSET_FOLDERS =
++            Arrays.asList("voxygen", "common", "world", "server");
++    private static final int MAX_ENTRIES = 50_000;
++
++    private final File root;
++    private final File packs;
++    private final long maxBytes;
++
++    ResourcePacks(File launcherDirectory) {
++        this(launcherDirectory, 1024L * 1024 * 1024);
++    }
++
++    ResourcePacks(File launcherDirectory, long maxBytes) {
++        this.root = launcherDirectory;
++        this.packs = new File(launcherDirectory, "packs");
++        this.maxBytes = maxBytes;
++    }
++
++    /** Installed packs, highest priority first. */
++    List<Pack> list() throws IOException {
++        List<Pack> result = new ArrayList<>();
++        List<String> seen = new ArrayList<>();
++        File order = new File(root, "packs.txt");
++        if (order.isFile()) {
++            for (String line : new String(Files.read(order), StandardCharsets.UTF_8)
++                    .split("\n")) {
++                if (line.length() < 3 || line.charAt(1) != '|') {
++                    continue;
++                }
++                String name = line.substring(2);
++                if (name.equals(clean(name)) && new File(packs, name).isDirectory()
++                        && !seen.contains(name)) {
++                    seen.add(name);
++                    result.add(new Pack(name, line.charAt(0) == '1'));
++                }
++            }
++        }
++        return result;
++    }
++
++    private void store(List<Pack> list) throws IOException {
++        StringBuilder text = new StringBuilder();
++        for (Pack pack : list) {
++            text.append(pack.enabled ? '1' : '0').append('|').append(pack.name).append('\n');
++        }
++        Files.writeAtomically(new File(root, "packs.txt"),
++                text.toString().getBytes(StandardCharsets.UTF_8));
++    }
++
++    /** Unpacks a zip as a new, enabled pack with the highest priority. */
++    String importZip(InputStream zip, String suggestedName) throws IOException {
++        File staging = new File(root, "import");
++        Files.delete(staging);
++        Files.makeDirectories(staging);
++        try {
++            unpack(zip, staging);
++            File assets = findAssets(staging);
++            if (assets == null) {
++                throw new IOException("Isi zip bukan resource pack: harus berisi folder "
++                        + "voxygen/, common/, world/ atau server/ (boleh di dalam assets/).");
++            }
++            String base = clean(suggestedName.replaceAll("(?i)\\.zip$", ""));
++            String name = base;
++            for (int copy = 2; new File(packs, name).exists(); copy++) {
++                name = base + " " + copy;
++            }
++            Files.makeDirectories(packs);
++            if (!assets.renameTo(new File(packs, name))) {
++                throw new IOException("Tidak bisa menyimpan resource pack.");
++            }
++            List<Pack> list = list();
++            list.add(0, new Pack(name, true));
++            store(list);
++            return name;
++        } finally {
++            Files.delete(staging);
++        }
++    }
++
++    private void unpack(InputStream zip, File destination) throws IOException {
++        String prefix = destination.getCanonicalPath() + File.separator;
++        long total = 0;
++        int entries = 0;
++        byte[] buffer = new byte[64 * 1024];
++        try (ZipInputStream input = new ZipInputStream(zip)) {
++            ZipEntry entry;
++            while ((entry = input.getNextEntry()) != null) {
++                if (++entries > MAX_ENTRIES) {
++                    throw new IOException("Zip berisi terlalu banyak berkas.");
++                }
++                String path = entry.getName().replace('\\', '/');
++                if (path.startsWith("__MACOSX/")) {
++                    continue;
++                }
++                File target = new File(destination, path);
++                // Refuse names that would land outside the folder ("zip slip").
++                if (path.startsWith("/") || !target.getCanonicalPath().startsWith(prefix)) {
++                    if (entry.isDirectory()
++                            && (target.getCanonicalPath() + File.separator).equals(prefix)) {
++                        continue;
++                    }
++                    throw new IOException("Zip berisi nama berkas yang tidak aman: " + path);
++                }
++                if (entry.isDirectory()) {
++                    Files.makeDirectories(target);
++                    continue;
++                }
++                Files.makeDirectories(target.getParentFile());
++                try (OutputStream output = new FileOutputStream(target)) {
++                    int count;
++                    while ((count = input.read(buffer)) >= 0) {
++                        total += count;
++                        if (total > maxBytes) {
++                            throw new IOException("Resource pack terlalu besar.");
++                        }
++                        output.write(buffer, 0, count);
++                    }
++                }
++            }
++        }
++        if (entries == 0) {
++            throw new IOException("Berkas ini bukan zip atau zip-nya kosong.");
++        }
++    }
++
++    /** The folder inside {@code directory} that corresponds to the game's assets. */
++    private static File findAssets(File directory) {
++        for (int depth = 0; depth < 3; depth++) {
++            File nested = new File(directory, "assets");
++            if (nested.isDirectory() && hasAssetFolder(nested)) {
++                return nested;
++            }
++            if (hasAssetFolder(directory)) {
++                return directory;
++            }
++            // Zips often wrap everything in one folder named after the pack.
++            File[] folders = directory.listFiles(File::isDirectory);
++            if (folders == null || folders.length != 1) {
++                return null;
++            }
++            directory = folders[0];
++        }
++        return null;
++    }
++
++    private static boolean hasAssetFolder(File directory) {
++        for (String folder : ASSET_FOLDERS) {
++            if (new File(directory, folder).isDirectory()) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    static String clean(String name) {
++        String cleaned = name.replaceAll("[^A-Za-z0-9 ._()-]", "_").trim();
++        if (cleaned.length() > 40) {
++            cleaned = cleaned.substring(0, 40).trim();
++        }
++        return cleaned.isEmpty() || cleaned.startsWith(".") ? "pack" + cleaned : cleaned;
++    }
++
++    void setEnabled(String name, boolean enabled) throws IOException {
++        List<Pack> list = list();
++        for (Pack pack : list) {
++            if (pack.name.equals(name)) {
++                pack.enabled = enabled;
++            }
++        }
++        store(list);
++    }
++
++    /** Moves a pack up ({@code -1}, more priority) or down ({@code 1}). */
++    void move(String name, int direction) throws IOException {
++        List<Pack> list = list();
++        for (int index = 0; index < list.size(); index++) {
++            if (list.get(index).name.equals(name)) {
++                int target = index + direction;
++                if (target >= 0 && target < list.size()) {
++                    Pack pack = list.remove(index);
++                    list.add(target, pack);
++                    store(list);
++                }
++                return;
++            }
++        }
++    }
++
++    void remove(String name) throws IOException {
++        List<Pack> list = list();
++        for (int index = list.size() - 1; index >= 0; index--) {
++            if (list.get(index).name.equals(name)) {
++                list.remove(index);
++                Files.delete(new File(packs, name));
++            }
++        }
++        store(list);
++    }
++
++    /** Rebuilds the folder the game reads from the enabled packs. */
++    void apply() throws IOException {
++        File override = new File(root, "override");
++        File staging = new File(root, "override-staging");
++        Files.delete(staging);
++        List<Pack> list = list();
++        boolean any = false;
++        // Lowest priority first, so that higher packs overwrite it.
++        for (int index = list.size() - 1; index >= 0; index--) {
++            if (list.get(index).enabled) {
++                merge(new File(packs, list.get(index).name), staging);
++                any = true;
++            }
++        }
++        Files.delete(override);
++        if (any && !staging.renameTo(override)) {
++            throw new IOException("Tidak bisa menerapkan resource pack.");
++        }
++    }
++
++    private static void merge(File source, File destination) throws IOException {
++        if (source.isDirectory()) {
++            Files.makeDirectories(destination);
++            File[] children = source.listFiles();
++            if (children == null) {
++                throw new IOException("Tidak bisa membaca " + source.getName());
++            }
++            for (File child : children) {
++                merge(child, new File(destination, child.getName()));
++            }
++            return;
++        }
++        try (InputStream input = new FileInputStream(source);
++                OutputStream output = new FileOutputStream(destination)) {
++            Files.copy(input, output);
++        }
 +    }
 +}
 diff --git a/android/app/src/main/java/net/veloren/android/UpdateDecision.java b/android/app/src/main/java/net/veloren/android/UpdateDecision.java
@@ -834,5 +2266,114 @@ index 00000000..337ae68b
 +        if (finishing) {
 +            Process.killProcess(Process.myPid());
 +        }
++    }
++}
+diff --git a/android/app/src/main/java/net/veloren/android/Widgets.java b/android/app/src/main/java/net/veloren/android/Widgets.java
+new file mode 100644
+index 00000000..a0727c97
+--- /dev/null
++++ b/android/app/src/main/java/net/veloren/android/Widgets.java
+@@ -0,0 +1,103 @@
++package net.veloren.android;
++
++import android.content.Context;
++import android.graphics.Color;
++import android.graphics.drawable.GradientDrawable;
++import android.view.Gravity;
++import android.widget.Button;
++import android.widget.LinearLayout;
++import android.widget.TextView;
++
++/** The launcher's look: colours and the few styled views it is made of. */
++final class Widgets {
++    static final int BACKGROUND = Color.rgb(15, 19, 27);
++    static final int SIDEBAR = Color.rgb(22, 28, 39);
++    static final int CARD = Color.rgb(28, 36, 50);
++    static final int BUTTON = Color.rgb(48, 59, 79);
++    static final int ACCENT = Color.rgb(56, 142, 84);
++    static final int TEXT = Color.WHITE;
++    static final int MUTED = Color.rgb(160, 172, 190);
++
++    static int dp(Context context, float value) {
++        return Math.round(value * context.getResources().getDisplayMetrics().density);
++    }
++
++    static GradientDrawable box(Context context, int color) {
++        GradientDrawable shape = new GradientDrawable();
++        shape.setColor(color);
++        shape.setCornerRadius(dp(context, 8));
++        return shape;
++    }
++
++    static TextView text(Context context, String value, int size, int color) {
++        TextView view = new TextView(context);
++        view.setText(value);
++        view.setTextSize(size);
++        view.setTextColor(color);
++        return view;
++    }
++
++    static Button button(Context context, String label, Runnable action) {
++        Button view = new Button(context);
++        view.setText(label);
++        view.setAllCaps(false);
++        view.setTextColor(TEXT);
++        view.setTextSize(14);
++        view.setStateListAnimator(null);
++        view.setMinHeight(0);
++        view.setMinimumHeight(0);
++        view.setMinWidth(0);
++        view.setMinimumWidth(0);
++        view.setGravity(Gravity.CENTER);
++        view.setPadding(dp(context, 14), dp(context, 9), dp(context, 14), dp(context, 9));
++        view.setBackground(box(context, BUTTON));
++        view.setOnClickListener(ignored -> action.run());
++        return view;
++    }
++
++    static void highlight(Button button, boolean selected) {
++        button.setBackground(box(button.getContext(), selected ? ACCENT : BUTTON));
++    }
++
++    static LinearLayout column(Context context) {
++        LinearLayout view = new LinearLayout(context);
++        view.setOrientation(LinearLayout.VERTICAL);
++        return view;
++    }
++
++    static LinearLayout row(Context context) {
++        LinearLayout view = new LinearLayout(context);
++        view.setGravity(Gravity.CENTER_VERTICAL);
++        return view;
++    }
++
++    /** A rounded panel that groups related settings. */
++    static LinearLayout card(Context context) {
++        LinearLayout view = column(context);
++        view.setBackground(box(context, CARD));
++        int padding = dp(context, 14);
++        view.setPadding(padding, padding, padding, padding);
++        return view;
++    }
++
++    /** Adds {@code child} at its natural size with a small gap around it. */
++    static void add(LinearLayout parent, android.view.View child) {
++        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
++                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
++        int gap = dp(parent.getContext(), 4);
++        params.setMargins(gap, gap, gap, gap);
++        parent.addView(child, params);
++    }
++
++    /** Adds {@code child} across the whole width of {@code parent}. */
++    static void addWide(LinearLayout parent, android.view.View child) {
++        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
++                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
++        int gap = dp(parent.getContext(), 4);
++        params.setMargins(gap, gap, gap, gap);
++        parent.addView(child, params);
++    }
++
++    private Widgets() {
 +    }
 +}
