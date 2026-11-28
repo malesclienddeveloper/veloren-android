@@ -1,0 +1,838 @@
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index 48452365..a5ae59c8 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -39,6 +39,15 @@ android {
+         ndk {
+             abiFilters += "arm64-v8a"
+         }
++
++        // Read by the launcher to compare this build with the published ones.
++        resValue("string", "launcher_upstream_commit",
++            providers.gradleProperty("upstreamCommit").orElse("").get())
++        resValue("string", "launcher_upstream_date",
++            providers.gradleProperty("upstreamDate").orElse("").get())
++        resValue("string", "launcher_release_repo",
++            providers.gradleProperty("releaseRepo")
++                .orElse("malesclienddeveloper/veloren-android").get())
+     }
+ 
+     signingConfigs {
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index afdfa78a..8d6a3666 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -1,29 +1,38 @@
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+     <uses-permission android:name="android.permission.INTERNET" />
++    <!-- The launcher hands downloaded updates to the system package installer. -->
++    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+     <uses-feature android:glEsVersion="0x00030000" android:required="false" />
+     <uses-feature android:name="android.hardware.vulkan.level" android:version="1" android:required="false" />
+ 
+     <application
+         android:allowBackup="false"
+-        android:hasCode="false"
+         android:icon="@mipmap/ic_launcher"
+         android:roundIcon="@mipmap/ic_launcher"
+         android:label="Veloren"
+         android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+         <activity
+-            android:name="android.app.NativeActivity"
++            android:name=".LauncherActivity"
+             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
+             android:exported="true"
++            android:screenOrientation="sensorLandscape">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++        </activity>
++        <activity
++            android:name=".VelorenGameActivity"
++            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
++            android:exported="false"
++            android:launchMode="singleTask"
++            android:process=":game"
+             android:screenOrientation="landscape"
+             android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen"
+             android:windowSoftInputMode="stateHidden|adjustResize">
+             <meta-data
+                 android:name="android.app.lib_name"
+                 android:value="veloren_voxygen" />
+-            <intent-filter>
+-                <action android:name="android.intent.action.MAIN" />
+-                <category android:name="android.intent.category.LAUNCHER" />
+-            </intent-filter>
+         </activity>
+     </application>
+ </manifest>
+diff --git a/android/app/src/main/java/net/veloren/android/LauncherActivity.java b/android/app/src/main/java/net/veloren/android/LauncherActivity.java
+new file mode 100644
+index 00000000..36c77b4d
+--- /dev/null
++++ b/android/app/src/main/java/net/veloren/android/LauncherActivity.java
+@@ -0,0 +1,634 @@
++package net.veloren.android;
++
++import android.app.Activity;
++import android.app.DownloadManager;
++import android.content.ActivityNotFoundException;
++import android.content.Context;
++import android.content.Intent;
++import android.content.SharedPreferences;
++import android.content.pm.PackageInfo;
++import android.content.pm.PackageManager;
++import android.content.pm.Signature;
++import android.database.Cursor;
++import android.graphics.Color;
++import android.net.Uri;
++import android.os.Build;
++import android.os.Bundle;
++import android.os.Environment;
++import android.os.Handler;
++import android.os.Looper;
++import android.provider.Settings;
++import android.view.Gravity;
++import android.view.View;
++import android.widget.Button;
++import android.widget.LinearLayout;
++import android.widget.ProgressBar;
++import android.widget.ScrollView;
++import android.widget.TextView;
++
++import org.json.JSONException;
++import org.json.JSONObject;
++
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.net.HttpURLConnection;
++import java.net.URL;
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.util.Locale;
++
++/** First screen of the app: checks for updates, then starts the game. */
++public class LauncherActivity extends Activity {
++    /** The weekly tag of the official repository is what the official server runs. */
++    private static final String OFFICIAL_WEEKLY_URL =
++            "https://gitlab.com/api/v4/projects/veloren%2Fveloren/repository/tags/weekly";
++    private static final String APK_MIME = "application/vnd.android.package-archive";
++    private static final String PREF_ID = "downloadId";
++    private static final String PREF_CODE = "downloadCode";
++    private static final String PREF_SHA = "downloadSha";
++    private static final int AUTO_START_SECONDS = 3;
++    private static final long SPARE_BYTES = 200L * 1024 * 1024;
++
++    private final Handler handler = new Handler(Looper.getMainLooper());
++    private TextView status;
++    private TextView detail;
++    private ProgressBar progress;
++    private LinearLayout buttons;
++    private SharedPreferences prefs;
++    private DownloadManager downloads;
++
++    private String repo;
++    private String installedCommit;
++    private String installedSigner;
++    private long installedCode;
++
++    /** Incremented to make results of older background work irrelevant. */
++    private int generation;
++    private boolean resumed;
++    /** Countdown or download poll; only runs while the screen is in front. */
++    private Runnable ticker;
++    private int secondsLeft;
++
++    @Override
++    protected void onCreate(Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++        // Tapping the app icon while the game is open must return to the game.
++        if (!isTaskRoot() && Intent.ACTION_MAIN.equals(getIntent().getAction())) {
++            finish();
++            return;
++        }
++
++        prefs = getSharedPreferences("launcher", MODE_PRIVATE);
++        downloads = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
++        repo = getString(R.string.launcher_release_repo);
++        installedCommit = getString(R.string.launcher_upstream_commit);
++        installedCode = readInstalledCode();
++        installedSigner = readInstalledSigner();
++        buildLayout();
++
++        // The downloaded APK is large: delete it once it has been installed.
++        long downloaded = prefs.getLong(PREF_CODE, 0);
++        if (downloaded != 0 && installedCode >= downloaded) {
++            forgetDownload();
++        }
++        checkForUpdate();
++    }
++
++    @Override
++    protected void onResume() {
++        super.onResume();
++        resumed = true;
++        secondsLeft = AUTO_START_SECONDS;
++        if (ticker != null) {
++            handler.post(ticker);
++        }
++    }
++
++    @Override
++    protected void onPause() {
++        resumed = false;
++        handler.removeCallbacksAndMessages(null);
++        super.onPause();
++    }
++
++    @Override
++    protected void onDestroy() {
++        generation++;
++        handler.removeCallbacksAndMessages(null);
++        super.onDestroy();
++    }
++
++    private void setTicker(Runnable next) {
++        handler.removeCallbacksAndMessages(null);
++        ticker = next;
++        if (resumed && next != null) {
++            handler.post(next);
++        }
++    }
++
++    // Update check
++
++    private void checkForUpdate() {
++        final int mine = ++generation;
++        setTicker(null);
++        show("Mengecek update…", "", button("Lewati dan main", this::startGame));
++        progress.setVisibility(View.VISIBLE);
++        progress.setIndeterminate(true);
++
++        final String releaseUrl =
++                "https://github.com/" + repo + "/releases/latest/download/version.properties";
++        new Thread(() -> {
++            UpdateDecision.Release release = null;
++            String officialCommit = null;
++            String officialDate = "";
++            String problem = "";
++            try {
++                release = UpdateDecision.Release.parse(fetch(releaseUrl), repo);
++            } catch (IOException e) {
++                // No release published yet looks the same as being offline here.
++                problem = "Daftar APK: " + e.getMessage();
++            }
++            try {
++                JSONObject commit =
++                        new JSONObject(fetch(OFFICIAL_WEEKLY_URL)).getJSONObject("commit");
++                officialCommit = commit.getString("id");
++                officialDate = commit.optString("committed_date");
++            } catch (IOException | JSONException e) {
++                problem = "Repo resmi: " + e.getMessage();
++            }
++            final UpdateDecision.Release foundRelease = release;
++            final String foundCommit = officialCommit;
++            final String foundDate = officialDate;
++            final String foundProblem = problem;
++            runOnUiThread(() -> {
++                if (mine == generation) {
++                    onChecked(foundRelease, foundCommit, foundDate, foundProblem);
++                }
++            });
++        }, "update-check").start();
++    }
++
++    private void onChecked(UpdateDecision.Release release, String officialCommit,
++            String officialDate, String problem) {
++        // An update that is already downloading or downloaded takes precedence,
++        // unless an even newer one has been published since.
++        long downloaded = prefs.getLong(PREF_CODE, 0);
++        if (downloaded > installedCode
++                && (release == null || release.versionCode <= downloaded)) {
++            trackDownload();
++            return;
++        }
++
++        switch (UpdateDecision.decide(installedCode, installedCommit, installedSigner, release,
++                officialCommit)) {
++            case UP_TO_DATE:
++                countDown();
++                break;
++            case APK_UPDATE:
++                offerUpdate(release, "");
++                break;
++            case APK_KEY_MISMATCH:
++                show("Update perlu pasang ulang",
++                        "APK terbaru ditandatangani dengan kunci berbeda. Hapus aplikasi ini "
++                                + "(pengaturan akan hilang), lalu pasang APK dari halaman rilis.",
++                        button("Buka halaman rilis",
++                                () -> browse("https://github.com/" + repo + "/releases/latest")),
++                        button("Main versi ini", this::startGame));
++                break;
++            case BUILD_PENDING:
++                show("Veloren resmi punya versi baru",
++                        "Versi mingguan " + describe(officialCommit, officialDate)
++                                + " belum tersedia sebagai APK. Build otomatis berjalan berkala, "
++                                + "cek lagi nanti.",
++                        button("Main versi ini", this::startGame),
++                        button("Cek lagi", this::checkForUpdate),
++                        button("Lihat build",
++                                () -> browse("https://github.com/" + repo + "/actions")));
++                break;
++            default:
++                show("Tidak bisa cek update",
++                        problem.isEmpty()
++                                ? "Versi APK ini tidak diketahui."
++                                : problem,
++                        button("Main", this::startGame),
++                        button("Cek lagi", this::checkForUpdate));
++                break;
++        }
++    }
++
++    private void countDown() {
++        secondsLeft = AUTO_START_SECONDS;
++        show("Sudah versi terbaru", "",
++                button("Main sekarang", this::startGame),
++                button("Tunggu", () -> {
++                    setTicker(null);
++                    detail.setText("");
++                }),
++                button("Cek lagi", this::checkForUpdate));
++        setTicker(new Runnable() {
++            @Override
++            public void run() {
++                if (secondsLeft <= 0) {
++                    startGame();
++                    return;
++                }
++                detail.setText("Masuk game dalam " + secondsLeft + " detik…");
++                secondsLeft--;
++                handler.postDelayed(this, 1000);
++            }
++        });
++    }
++
++    private void startGame() {
++        generation++;
++        setTicker(null);
++        startActivity(new Intent(this, VelorenGameActivity.class));
++        finish();
++    }
++
++    // Download and installation
++
++    private void offerUpdate(UpdateDecision.Release release, String note) {
++        String text = "Veloren " + describe(release.commit, release.date) + ", "
++                + megabytes(release.size) + " MB. Disarankan memakai Wi-Fi.";
++        show("Update tersedia", note.isEmpty() ? text : note + "\n" + text,
++                button("Unduh update", () -> startDownload(release)),
++                button("Main dulu", this::startGame));
++    }
++
++    private void startDownload(UpdateDecision.Release release) {
++        if (!getPackageManager().canRequestPackageInstalls()) {
++            askInstallPermission();
++            offerUpdate(release,
++                    "Izinkan aplikasi ini memasang APK, kembali ke sini, lalu tekan Unduh lagi.");
++            return;
++        }
++        forgetDownload();
++        try {
++            File directory = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
++            if (directory == null) {
++                offerUpdate(release, "Penyimpanan tidak tersedia.");
++                return;
++            }
++            if (directory.getUsableSpace() < release.size + SPARE_BYTES) {
++                offerUpdate(release, "Ruang kosong kurang. Sediakan minimal "
++                        + megabytes(release.size + SPARE_BYTES) + " MB.");
++                return;
++            }
++            String name = "veloren-update-" + release.versionCode + ".apk";
++            File old = new File(directory, name);
++            if (old.exists() && !old.delete()) {
++                offerUpdate(release, "Berkas unduhan lama tidak bisa dihapus.");
++                return;
++            }
++            DownloadManager.Request request =
++                    new DownloadManager.Request(Uri.parse(release.url))
++                            .setTitle("Update Veloren")
++                            .setMimeType(APK_MIME)
++                            .setNotificationVisibility(
++                                    DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
++                            .setDestinationInExternalFilesDir(
++                                    this, Environment.DIRECTORY_DOWNLOADS, name);
++            long id = downloads.enqueue(request);
++            prefs.edit()
++                    .putLong(PREF_ID, id)
++                    .putLong(PREF_CODE, release.versionCode)
++                    .putString(PREF_SHA, release.sha256)
++                    .apply();
++        } catch (RuntimeException e) {
++            // For example when the system download manager has been disabled.
++            offerUpdate(release, "Unduhan gagal dimulai: " + e.getMessage());
++            return;
++        }
++        trackDownload();
++    }
++
++    private void trackDownload() {
++        final long id = prefs.getLong(PREF_ID, -1);
++        show("Mengunduh update…", "",
++                button("Main dulu", this::startGame),
++                button("Batalkan", () -> {
++                    forgetDownload();
++                    checkForUpdate();
++                }));
++        progress.setVisibility(View.VISIBLE);
++        progress.setIndeterminate(true);
++        setTicker(new Runnable() {
++            @Override
++            public void run() {
++                int state;
++                int reason;
++                long done;
++                long total;
++                try (Cursor cursor =
++                        downloads.query(new DownloadManager.Query().setFilterById(id))) {
++                    if (cursor == null || !cursor.moveToFirst()) {
++                        downloadFailed("Unduhan dibatalkan atau berkasnya hilang.");
++                        return;
++                    }
++                    state = cursor.getInt(
++                            cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
++                    reason = cursor.getInt(
++                            cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON));
++                    done = cursor.getLong(cursor.getColumnIndexOrThrow(
++                            DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
++                    total = cursor.getLong(cursor.getColumnIndexOrThrow(
++                            DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
++                }
++                if (state == DownloadManager.STATUS_SUCCESSFUL) {
++                    verifyDownload(id);
++                    return;
++                }
++                if (state == DownloadManager.STATUS_FAILED) {
++                    downloadFailed("Unduhan gagal (kode " + reason + ").");
++                    return;
++                }
++                if (total > 0) {
++                    progress.setIndeterminate(false);
++                    progress.setProgress((int) (done * 1000 / total));
++                }
++                String amount = megabytes(done) + (total > 0 ? " / " + megabytes(total) : "")
++                        + " MB";
++                detail.setText(state == DownloadManager.STATUS_PAUSED
++                        ? amount + " (dijeda, menunggu jaringan)"
++                        : amount);
++                handler.postDelayed(this, 700);
++            }
++        });
++    }
++
++    private void verifyDownload(long id) {
++        final int mine = ++generation;
++        final String expected = prefs.getString(PREF_SHA, "");
++        setTicker(null);
++        show("Memeriksa berkas…", "", button("Main dulu", this::startGame));
++        progress.setVisibility(View.VISIBLE);
++        progress.setIndeterminate(true);
++        new Thread(() -> {
++            boolean matches = false;
++            Uri uri = downloads.getUriForDownloadedFile(id);
++            if (uri != null) {
++                try (InputStream input = getContentResolver().openInputStream(uri)) {
++                    if (input != null) {
++                        MessageDigest digest = sha256();
++                        byte[] buffer = new byte[64 * 1024];
++                        int count;
++                        while ((count = input.read(buffer)) >= 0) {
++                            digest.update(buffer, 0, count);
++                        }
++                        matches = hex(digest.digest()).equals(expected);
++                    }
++                } catch (IOException | SecurityException e) {
++                    matches = false;
++                }
++            }
++            final boolean ok = matches;
++            runOnUiThread(() -> {
++                if (mine != generation) {
++                    return;
++                }
++                if (!ok) {
++                    downloadFailed("Berkas unduhan rusak.");
++                    return;
++                }
++                offerInstall(id);
++                if (resumed) {
++                    install(id);
++                }
++            });
++        }, "update-verify").start();
++    }
++
++    private void offerInstall(long id) {
++        show("Update siap dipasang",
++                "Data game akan disiapkan ulang saat pertama dibuka setelah update.",
++                button("Pasang", () -> install(id)),
++                button("Main dulu", this::startGame),
++                button("Hapus unduhan", () -> {
++                    forgetDownload();
++                    checkForUpdate();
++                }));
++    }
++
++    private void install(long id) {
++        if (!getPackageManager().canRequestPackageInstalls()) {
++            askInstallPermission();
++            return;
++        }
++        Uri uri = downloads.getUriForDownloadedFile(id);
++        if (uri == null) {
++            downloadFailed("Berkas unduhan hilang.");
++            return;
++        }
++        try {
++            startActivity(new Intent(Intent.ACTION_VIEW)
++                    .setDataAndType(uri, APK_MIME)
++                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION));
++        } catch (ActivityNotFoundException | SecurityException e) {
++            detail.setText("Pemasang APK tidak bisa dibuka. Buka berkas dari notifikasi unduhan.");
++        }
++    }
++
++    private void downloadFailed(String message) {
++        forgetDownload();
++        setTicker(null);
++        show("Update gagal", message,
++                button("Cek lagi", this::checkForUpdate),
++                button("Main", this::startGame));
++    }
++
++    private void forgetDownload() {
++        long id = prefs.getLong(PREF_ID, -1);
++        if (id >= 0) {
++            try {
++                // Also deletes the file.
++                downloads.remove(id);
++            } catch (RuntimeException e) {
++                // Nothing more can be done if the download manager is unavailable.
++            }
++        }
++        prefs.edit().remove(PREF_ID).remove(PREF_CODE).remove(PREF_SHA).apply();
++    }
++
++    private void askInstallPermission() {
++        try {
++            startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
++                    Uri.parse("package:" + getPackageName())));
++        } catch (ActivityNotFoundException e) {
++            detail.setText("Aktifkan \"Instal aplikasi tidak dikenal\" di pengaturan Android.");
++        }
++    }
++
++    private void browse(String address) {
++        try {
++            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(address)));
++        } catch (ActivityNotFoundException e) {
++            detail.setText(address);
++        }
++    }
++
++    // Installed version
++
++    @SuppressWarnings("deprecation")
++    private long readInstalledCode() {
++        try {
++            return getPackageManager().getPackageInfo(getPackageName(), 0).versionCode;
++        } catch (PackageManager.NameNotFoundException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    @SuppressWarnings("deprecation")
++    private String readInstalledSigner() {
++        try {
++            Signature[] signatures;
++            if (Build.VERSION.SDK_INT >= 28) {
++                PackageInfo info = getPackageManager().getPackageInfo(
++                        getPackageName(), PackageManager.GET_SIGNING_CERTIFICATES);
++                signatures = info.signingInfo == null
++                        ? null
++                        : info.signingInfo.getApkContentsSigners();
++            } else {
++                signatures = getPackageManager().getPackageInfo(
++                        getPackageName(), PackageManager.GET_SIGNATURES).signatures;
++            }
++            if (signatures == null || signatures.length != 1) {
++                return "";
++            }
++            return hex(sha256().digest(signatures[0].toByteArray()));
++        } catch (PackageManager.NameNotFoundException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    // Helpers
++
++    private static String fetch(String address) throws IOException {
++        HttpURLConnection connection = (HttpURLConnection) new URL(address).openConnection();
++        connection.setConnectTimeout(10_000);
++        connection.setReadTimeout(10_000);
++        connection.setUseCaches(false);
++        connection.setRequestProperty("User-Agent", "veloren-android-launcher");
++        try {
++            int code = connection.getResponseCode();
++            if (code != HttpURLConnection.HTTP_OK) {
++                throw new IOException("HTTP " + code);
++            }
++            try (InputStream input = connection.getInputStream()) {
++                ByteArrayOutputStream output = new ByteArrayOutputStream();
++                byte[] buffer = new byte[8 * 1024];
++                int count;
++                while ((count = input.read(buffer)) >= 0) {
++                    output.write(buffer, 0, count);
++                    if (output.size() > 256 * 1024) {
++                        throw new IOException("jawaban terlalu besar");
++                    }
++                }
++                return new String(output.toByteArray(), StandardCharsets.UTF_8);
++            }
++        } finally {
++            connection.disconnect();
++        }
++    }
++
++    private static MessageDigest sha256() {
++        try {
++            return MessageDigest.getInstance("SHA-256");
++        } catch (NoSuchAlgorithmException e) {
++            throw new IllegalStateException(e);
++        }
++    }
++
++    private static String hex(byte[] bytes) {
++        StringBuilder text = new StringBuilder(bytes.length * 2);
++        for (byte value : bytes) {
++            text.append(String.format(Locale.ROOT, "%02x", value & 0xff));
++        }
++        return text.toString();
++    }
++
++    private static long megabytes(long bytes) {
++        return bytes / (1024 * 1024);
++    }
++
++    /** Short commit id and calendar day, for example "6c99b292 (2026-11-10)". */
++    private static String describe(String commit, String date) {
++        String id = commit.length() > 8 ? commit.substring(0, 8) : commit;
++        return date.length() >= 10 ? id + " (" + date.substring(0, 10) + ")" : id;
++    }
++
++    // Layout
++
++    private void buildLayout() {
++        LinearLayout column = new LinearLayout(this);
++        column.setOrientation(LinearLayout.VERTICAL);
++        column.setGravity(Gravity.CENTER);
++        column.setPadding(dp(32), dp(20), dp(32), dp(20));
++
++        TextView title = text(34, Color.WHITE);
++        title.setText("Veloren");
++        TextView version = text(13, Color.rgb(140, 150, 165));
++        version.setText(installedCommit.isEmpty()
++                ? "Terpasang: versi tidak diketahui"
++                : "Terpasang: " + describe(installedCommit,
++                        getString(R.string.launcher_upstream_date)));
++        status = text(20, Color.WHITE);
++        status.setPadding(0, dp(18), 0, dp(6));
++        detail = text(14, Color.rgb(190, 200, 215));
++        progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
++        progress.setMax(1000);
++        buttons = new LinearLayout(this);
++        buttons.setGravity(Gravity.CENTER);
++        buttons.setPadding(0, dp(18), 0, 0);
++
++        column.addView(title);
++        column.addView(version);
++        column.addView(status);
++        column.addView(detail);
++        column.addView(progress, new LinearLayout.LayoutParams(dp(360), dp(24)));
++        column.addView(buttons);
++
++        ScrollView scroll = new ScrollView(this);
++        scroll.setFillViewport(true);
++        scroll.setBackgroundColor(Color.rgb(16, 20, 28));
++        scroll.addView(column);
++        setContentView(scroll);
++    }
++
++    private TextView text(int size, int color) {
++        TextView view = new TextView(this);
++        view.setTextSize(size);
++        view.setTextColor(color);
++        view.setGravity(Gravity.CENTER);
++        return view;
++    }
++
++    private void show(String headline, String explanation, Button... actions) {
++        status.setText(headline);
++        detail.setText(explanation);
++        progress.setVisibility(View.GONE);
++        buttons.removeAllViews();
++        for (Button action : actions) {
++            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
++                    LinearLayout.LayoutParams.WRAP_CONTENT,
++                    LinearLayout.LayoutParams.WRAP_CONTENT);
++            params.setMargins(dp(6), 0, dp(6), 0);
++            buttons.addView(action, params);
++        }
++    }
++
++    private Button button(String label, Runnable action) {
++        Button view = new Button(this);
++        view.setText(label);
++        view.setAllCaps(false);
++        view.setOnClickListener(ignored -> action.run());
++        return view;
++    }
++
++    private int dp(int value) {
++        return Math.round(value * getResources().getDisplayMetrics().density);
++    }
++}
+diff --git a/android/app/src/main/java/net/veloren/android/UpdateDecision.java b/android/app/src/main/java/net/veloren/android/UpdateDecision.java
+new file mode 100644
+index 00000000..33b60811
+--- /dev/null
++++ b/android/app/src/main/java/net/veloren/android/UpdateDecision.java
+@@ -0,0 +1,98 @@
++package net.veloren.android;
++
++import java.io.IOException;
++import java.io.StringReader;
++import java.util.Locale;
++import java.util.Properties;
++
++/** Pure update-check logic, kept free of Android classes so it can be tested on any JVM. */
++final class UpdateDecision {
++    enum Status {
++        /** Installed build matches the official weekly release. */
++        UP_TO_DATE,
++        /** A newer APK is published and can be installed over this one. */
++        APK_UPDATE,
++        /** A newer APK is published but signed with a different key. */
++        APK_KEY_MISMATCH,
++        /** The official weekly release moved on, but no APK is published for it yet. */
++        BUILD_PENDING,
++        /** Not enough information to say anything. */
++        CHECK_FAILED
++    }
++
++    /** Contents of the version.properties file attached to a published release. */
++    static final class Release {
++        final long versionCode;
++        final String commit;
++        final String date;
++        final String url;
++        final String sha256;
++        final long size;
++        final String signer;
++
++        private Release(long versionCode, String commit, String date, String url,
++                String sha256, long size, String signer) {
++            this.versionCode = versionCode;
++            this.commit = commit;
++            this.date = date;
++            this.url = url;
++            this.sha256 = sha256;
++            this.size = size;
++            this.signer = signer;
++        }
++
++        /**
++         * Returns null when the text is not a complete release description, or when the
++         * download address is not a release asset of {@code repo}.
++         */
++        static Release parse(String text, String repo) {
++            Properties properties = new Properties();
++            try {
++                properties.load(new StringReader(text));
++                long versionCode = Long.parseLong(value(properties, "versionCode"));
++                long size = Long.parseLong(value(properties, "size"));
++                String commit = value(properties, "commit");
++                String url = value(properties, "url");
++                String sha256 = value(properties, "sha256").toLowerCase(Locale.ROOT);
++                if (versionCode <= 0 || size <= 0 || commit.isEmpty()
++                        || !url.startsWith("https://github.com/" + repo + "/releases/download/")
++                        || !sha256.matches("[0-9a-f]{64}")) {
++                    return null;
++                }
++                return new Release(versionCode, commit, value(properties, "date"), url, sha256,
++                        size, value(properties, "signer").toLowerCase(Locale.ROOT));
++            } catch (IOException | IllegalArgumentException e) {
++                return null;
++            }
++        }
++
++        private static String value(Properties properties, String key) {
++            return properties.getProperty(key, "").trim();
++        }
++    }
++
++    /**
++     * @param installedCode   versionCode of the running APK
++     * @param installedCommit official commit the running APK was built from ("" if unknown)
++     * @param installedSigner SHA-256 of the running APK's signing certificate ("" if unknown)
++     * @param release         newest published APK, or null if it could not be fetched
++     * @param officialCommit  commit of the official weekly tag, or null if it could not be fetched
++     */
++    static Status decide(long installedCode, String installedCommit, String installedSigner,
++            Release release, String officialCommit) {
++        if (release != null && release.versionCode > installedCode) {
++            boolean differentKey = !release.signer.isEmpty() && !installedSigner.isEmpty()
++                    && !release.signer.equalsIgnoreCase(installedSigner);
++            return differentKey ? Status.APK_KEY_MISMATCH : Status.APK_UPDATE;
++        }
++        if (officialCommit == null || officialCommit.isEmpty() || installedCommit.isEmpty()) {
++            return Status.CHECK_FAILED;
++        }
++        return officialCommit.equalsIgnoreCase(installedCommit)
++                ? Status.UP_TO_DATE
++                : Status.BUILD_PENDING;
++    }
++
++    private UpdateDecision() {
++    }
++}
+diff --git a/android/app/src/main/java/net/veloren/android/VelorenGameActivity.java b/android/app/src/main/java/net/veloren/android/VelorenGameActivity.java
+new file mode 100644
+index 00000000..337ae68b
+--- /dev/null
++++ b/android/app/src/main/java/net/veloren/android/VelorenGameActivity.java
+@@ -0,0 +1,19 @@
++package net.veloren.android;
++
++import android.app.NativeActivity;
++import android.os.Process;
++
++/**
++ * The game itself. It runs in its own process (see the manifest) which is ended together
++ * with the activity: the native event loop cannot be started twice in one process.
++ */
++public class VelorenGameActivity extends NativeActivity {
++    @Override
++    protected void onDestroy() {
++        boolean finishing = isFinishing();
++        super.onDestroy();
++        if (finishing) {
++            Process.killProcess(Process.myPid());
++        }
++    }
++}

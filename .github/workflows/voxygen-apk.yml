@@ -1,20 +1,37 @@
-# Build APK debug Voxygen asli: port Android dari fork ejir/veloren (commit dipatok)
-# + patch di android-patches/ + master TERBARU dari Veloren resmi.
-# "Re-run all jobs" pada run terakhir sudah cukup untuk mengambil update baru.
+# Build APK Voxygen asli: port Android dari fork ejir/veloren (commit dipatok)
+# + patch di android-patches/ + rilis MINGGUAN terbaru dari Veloren resmi
+# (tag `weekly`, versi yang dipakai server resmi), lalu diterbitkan di Releases
+# supaya launcher di dalam APK bisa mengunduh update.
+#
+# Dipanggil oleh push ke android-test, dan oleh workflow "Cek update Veloren"
+# di branch master (otomatis kalau tag weekly berubah).
 name: Build Voxygen APK
 
 on:
   push:
     branches: [android-test]
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      kit_ref:
+        description: Branch berisi patch
+        type: string
+        required: true
 
 permissions:
   contents: read
+
+env:
+  PORT_COMMIT: f7f1684ddf9b44928af810964f11321692c8cf7b
 
 jobs:
   debug-apk:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    outputs:
+      commit: ${{ steps.versi.outputs.commit }}
+      date: ${{ steps.versi.outputs.date }}
+      code: ${{ steps.versi.outputs.code }}
+      kit_sha: ${{ steps.versi.outputs.kit_sha }}
     env:
       CARGO_BUILD_JOBS: 2
       CARGO_INCREMENTAL: 0
@@ -25,6 +42,7 @@ jobs:
       - name: Checkout patch
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.kit_ref || github.sha }}
           path: kit
           persist-credentials: false
 
@@ -32,14 +50,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ejir/veloren
-          ref: f7f1684ddf9b44928af810964f11321692c8cf7b
+          ref: ${{ env.PORT_COMMIT }}
           path: src
           # Riwayat penuh agar commit dasar port tersedia. Jangan pakai partial
           # clone (filter): git-lfs gagal memindai file di clone seperti itu.
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Pasang port Android di atas Veloren resmi terbaru
+      - name: Pasang port Android di atas rilis mingguan Veloren resmi
+        id: versi
         working-directory: src
         env:
           GIT_LFS_SKIP_SMUDGE: "1"
@@ -57,8 +76,8 @@ jobs:
           # di-merge. Selisih port diterapkan dengan 3-way di atas master resmi.
           # HEAD tetap commit resmi, sehingga versi yang dilaporkan ke server asli.
           git remote add upstream https://gitlab.com/veloren/veloren.git
-          git fetch upstream master
-          git checkout -q --detach upstream/master
+          git fetch upstream "+refs/tags/weekly:refs/tags/upstream-weekly"
+          git checkout -q --detach "upstream-weekly^{commit}"
           # Gagal di sini berarti ada konflik antara update resmi dan port Android.
           git apply --3way --index "$RUNNER_TEMP/port.diff"
 
@@ -74,8 +93,27 @@ jobs:
           fi
           {
             echo "### Versi yang dibuild"
-            git log -1 --date=iso --pretty='Veloren resmi: `%h` (%cd) %s'
+            git log -1 --date=iso --pretty='Veloren resmi (weekly): `%h` (%cd) %s'
           } >> "$GITHUB_STEP_SUMMARY"
+
+          commit="$(git rev-parse HEAD)"
+          {
+            echo "commit=$commit"
+            echo "date=$(git log -1 --format=%cI)"
+            # Menit sejak 1970: selalu naik, jadi APK baru selalu bisa menimpa.
+            echo "code=$(( $(date +%s) / 60 ))"
+            echo "kit_sha=$(git -C ../kit rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+          # Launcher di HP bertanya ke API ini; pastikan jawabannya cocok.
+          api="$(curl -fsSL --max-time 30 \
+            'https://gitlab.com/api/v4/projects/veloren%2Fveloren/repository/tags/weekly' \
+            | jq -r .commit.id || true)"
+          if [ "$api" = "$commit" ]; then
+            echo "API GitLab cocok: $api"
+          else
+            echo "::warning::API GitLab menjawab '$api', commit yang dibuild '$commit'"
+          fi
 
       # Kunci debug yang sama di setiap build, agar APK baru bisa menimpa yang lama.
       - uses: actions/cache@v4
@@ -134,10 +172,93 @@ jobs:
 
       - name: Build APK debug
         working-directory: src/android
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+        env:
+          CODE: ${{ steps.versi.outputs.code }}
+          COMMIT: ${{ steps.versi.outputs.commit }}
+          DATE: ${{ steps.versi.outputs.date }}
+        run: |
+          gradle :app:assembleDebug --no-daemon --stacktrace \
+            -PandroidVersionCode="$CODE" \
+            -PandroidVersionName="weekly-${COMMIT:0:8}" \
+            -PupstreamCommit="$COMMIT" \
+            -PupstreamDate="$DATE" \
+            -PreleaseRepo="$GITHUB_REPOSITORY"
 
       - uses: actions/upload-artifact@v4
         with:
           name: veloren-voxygen-debug
           path: src/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+  # Terpisah dari job build: kunci tetap dan izin menulis tidak pernah terlihat
+  # oleh skrip build dari kode pihak lain.
+  rilis:
+    needs: debug-apk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    concurrency:
+      group: voxygen-rilis
+    env:
+      HAS_SIGNING_KEY: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 != '' }}
+    steps:
+      - name: Kunci tanda tangan belum diisi
+        if: env.HAS_SIGNING_KEY != 'true'
+        run: |
+          msg="Secret ANDROID_DEBUG_KEYSTORE_BASE64 belum diisi, jadi APK tidak diterbitkan di Releases."
+          echo "::warning::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/download-artifact@v4
+        if: env.HAS_SIGNING_KEY == 'true'
+        with:
+          name: veloren-voxygen-debug
+
+      - name: Tanda tangani dan terbitkan
+        if: env.HAS_SIGNING_KEY == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
+          GH_TOKEN: ${{ github.token }}
+          CODE: ${{ needs.debug-apk.outputs.code }}
+          COMMIT: ${{ needs.debug-apk.outputs.commit }}
+          DATE: ${{ needs.debug-apk.outputs.date }}
+          KIT_SHA: ${{ needs.debug-apk.outputs.kit_sha }}
+        run: |
+          set -euo pipefail
+          keystore="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$KEYSTORE_B64" | tr -d '[:space:]' | base64 -d > "$keystore"
+          tools="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)"
+          "$tools/apksigner" sign --ks "$keystore" --ks-key-alias androiddebugkey \
+            --ks-pass pass:android --key-pass pass:android \
+            --out veloren-android.apk app-debug.apk
+          rm "$keystore"
+          certs="$("$tools/apksigner" verify --print-certs veloren-android.apk)"
+          signer="$(awk '/certificate SHA-256 digest:/ {print $NF; exit}' <<< "$certs")"
+          test -n "$signer"
+
+          tag="build-$CODE"
+          {
+            echo "versionCode=$CODE"
+            echo "commit=$COMMIT"
+            echo "date=$DATE"
+            echo "url=https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/veloren-android.apk"
+            echo "sha256=$(sha256sum veloren-android.apk | cut -d' ' -f1)"
+            echo "size=$(stat -c %s veloren-android.apk)"
+            echo "signer=$signer"
+          } > version.properties
+          cat version.properties
+
+          cat > notes.md <<EOF
+          Build otomatis Veloren untuk Android (arm64), tidak resmi dan eksperimental.
+
+          - Veloren resmi (weekly): https://gitlab.com/veloren/veloren/-/tree/$COMMIT
+          - Port Android: https://github.com/ejir/veloren/tree/$PORT_COMMIT
+          - Patch dan workflow: https://github.com/$GITHUB_REPOSITORY/tree/$KIT_SHA
+
+          Veloren berlisensi GPL-3.0.
+          EOF
+          # Tanpa --target: tag dibuat di branch utama.
+          gh release create "$tag" veloren-android.apk version.properties \
+            --repo "$GITHUB_REPOSITORY" --latest \
+            --title "Veloren Android ${COMMIT:0:8} ($CODE)" --notes-file notes.md
